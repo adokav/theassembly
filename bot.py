@@ -314,5 +314,31 @@ def callback_handler(call):
 
 
 if __name__ == "__main__":
+    # Surface polling/Telegram errors instead of silently swallowing them.
+    telebot.logger.setLevel(logging.INFO)
+
+    # 1) Verify the token & network reach Telegram. Fails fast with a clear
+    #    message instead of a silent "no response" bot.
+    try:
+        me = bot.get_me()
+        log.info("Telegram bağlantısı OK → @%s (id=%s)", me.username, me.id)
+    except Exception as e:  # noqa: BLE001
+        log.error(
+            "Telegram'a bağlanılamadı. TELEGRAM_TOKEN yanlış olabilir ya da ağ "
+            "api.telegram.org'a çıkamıyor. Hata: %s", str(e)[:200],
+        )
+        sys.exit(1)
+
+    # 2) Clear any leftover webhook — a set webhook makes getUpdates (polling)
+    #    return 409 and the bot silently receives no messages.
+    try:
+        bot.remove_webhook()
+        log.info("Webhook temizlendi; polling moduna geçiliyor.")
+    except Exception as e:  # noqa: BLE001
+        log.warning("Webhook temizlenemedi: %s", str(e)[:160])
+
     log.info("🚀 The Assembly Grok AI Botu BAŞLATILDI (%d RSS kaynağı yapılandırıldı)", len(RSS_URLS))
-    bot.infinity_polling()
+    # skip_pending: ignore the backlog accrued while the bot was offline.
+    # If a second instance runs the same token, Telegram returns 409 — that is
+    # now logged (above) instead of being invisible.
+    bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=30)
