@@ -10,6 +10,9 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler
 
 load_dotenv()
 
+import nest_asyncio
+nest_asyncio.apply()
+
 # ====================== CONFIG ======================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 RSS_URL = os.getenv("RSS_URL")
