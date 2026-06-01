@@ -28,8 +28,18 @@ pip install -r requirements.txt
 python bot.py
 ```
 
-Render gibi platformlarda **Background Worker** olarak, başlatma komutu `python bot.py`
-ile çalıştırın.
+### Render
+Başlatma komutu: `python bot.py`
+
+- **Background Worker** olarak çalıştırmak en temizidir (port gerekmez).
+- **Web Service** olarak çalıştırırsan da çalışır: bot, `PORT` tanımlıysa otomatik
+  olarak küçük bir health endpoint açar, böylece Render'ın port/health kontrolü geçer.
+  (Aksi halde Web Service polling botunu sürekli yeniden başlatır ve bot Telegram'a
+  yanıt veremez — "yanıt yok" sorununun en yaygın sebebi budur.)
+
+Bot başlarken log'da `Telegram bağlantısı OK → @kullanıcı_adı` satırını görmelisin.
+Görmüyorsan `TELEGRAM_TOKEN` yanlıştır ya da ağ `api.telegram.org`'a çıkamıyordur.
+`409 Conflict` görüyorsan aynı token'la ikinci bir kopya çalışıyordur.
 
 ## Notlar
 - Veri kaynağı (RSS aynası) kapanırsa bot kullanıcıyı bilgilendirir.

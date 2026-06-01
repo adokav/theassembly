@@ -3,6 +3,8 @@ import sys
 import time
 import logging
 import calendar
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from datetime import datetime, timedelta
 
 import requests
@@ -313,9 +315,39 @@ def callback_handler(call):
     safe_send(chat_id, result, edit_message_id=msg_id)
 
 
+class _HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"ok")
+
+    def log_message(self, *args):  # silence per-request logging
+        pass
+
+
+def start_health_server():
+    """When PORT is set (e.g. Render Web Service), serve a tiny health endpoint
+    in a background thread so the platform's port/health check passes while the
+    bot polls. No-op for Background Workers (no PORT)."""
+    port = os.getenv("PORT")
+    if not port:
+        return
+    try:
+        server = HTTPServer(("0.0.0.0", int(port)), _HealthHandler)
+    except Exception as e:  # noqa: BLE001
+        log.warning("Health sunucusu başlatılamadı (PORT=%s): %s", port, str(e)[:160])
+        return
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    log.info("Health sunucusu %s portunda dinliyor.", port)
+
+
 if __name__ == "__main__":
     # Surface polling/Telegram errors instead of silently swallowing them.
     telebot.logger.setLevel(logging.INFO)
+
+    # Keep the platform health check happy if deployed as a Web Service.
+    start_health_server()
 
     # 1) Verify the token & network reach Telegram. Fails fast with a clear
     #    message instead of a silent "no response" bot.
