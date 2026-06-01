@@ -1,3 +1,3 @@
-# The Assembly Telegram Bot
+# The Assembly Grok AI Bot
 
-@InTheAssembly hesabının yeni paylaşımlarını RSS ile Telegram'a bildiren bot.
+Grok AI ile analiz yapan gelişmiş bot.

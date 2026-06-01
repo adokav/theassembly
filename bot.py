@@ -3,6 +3,7 @@ import time
 import feedparser
 import telegram
 from dotenv import load_dotenv
+from openai import OpenAI
 
 load_dotenv()
 
@@ -10,10 +11,16 @@ load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 RSS_URL = os.getenv("RSS_URL")
+XAI_API_KEY = os.getenv("XAI_API_KEY")
 
 LAST_GUID_FILE = "last_guid.txt"
 
 bot = telegram.Bot(token=TELEGRAM_TOKEN)
+
+client = OpenAI(
+    api_key=XAI_API_KEY,
+    base_url="https://api.x.ai/v1"
+)
 
 def get_last_guid():
     if os.path.exists(LAST_GUID_FILE):
@@ -28,33 +35,55 @@ def save_last_guid(guid):
     with open(LAST_GUID_FILE, "w") as f:
         f.write(guid)
 
+def analyze_with_grok(text):
+    try:
+        response = client.chat.completions.create(
+            model="grok-4",
+            messages=[
+                {"role": "system", "content": "Sen deneyimli bir makro analist ve trading uzmanısın. Kısa, net, profesyonel ve Türkçe rapor yaz."},
+                {"role": "user", "content": f"""
+Aşağıdaki The Assembly tweet'ini detaylı analiz et ve **madde madde** rapor ver:
+
+Tweet: "{text}"
+
+Rapor Formatı:
+• **Ana Konu ve Önem Seviyesi:**
+• **Piyasa Etkisi:**
+• **Fırsat / Risk Değerlendirmesi:**
+• **Trading / Yatırım Önerisi:**
+• **İzlenmesi Gereken Diğer Unsurlar:**
+                """}
+            ],
+            temperature=0.7,
+            max_tokens=800
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        return f"Analiz sırasında hata oluştu: {str(e)[:200]}"
+
 def check_new_posts():
     try:
         feed = feedparser.parse(RSS_URL)
-        
         if not feed.entries:
-            print("⚠️ RSS'den veri çekilemedi.")
+            print("RSS boş")
             return
 
         last_guid = get_last_guid()
-        new_posts = []
-
-        for entry in reversed(feed.entries):
-            if last_guid and entry.id == last_guid:
-                continue
-            new_posts.append(entry)
+        new_posts = [entry for entry in reversed(feed.entries) if not last_guid or entry.id != last_guid]
 
         for entry in new_posts:
             title = entry.title
             link = entry.link
-            summary = entry.get('summary', '')[:700]
+            summary = entry.get('summary', '')[:1000]
 
-            message = f"🔔 **The Assembly Yeni Paylaşım**\n\n"
-            message += f"**{title}**\n\n"
-            
-            if summary and len(summary) > 20:
-                message += f"{summary}\n\n"
-                
+            full_text = f"{title}\n\n{summary}"
+
+            print(f"📊 Grok analiz ediliyor: {title[:60]}...")
+            analysis = analyze_with_grok(full_text)
+
+            message = f"🔔 **The Assembly - Grok AI Analiz Raporu**\n\n"
+            message += f"**Orijinal İçerik:**\n{title}\n\n"
+            message += f"{analysis}\n\n"
             message += f"🔗 {link}"
 
             bot.send_message(
@@ -64,16 +93,16 @@ def check_new_posts():
                 disable_web_page_preview=False
             )
 
-            print(f"✅ Gönderildi → {title[:60]}...")
+            print(f"✅ Grok analiz raporu gönderildi!")
             save_last_guid(entry.id)
-            time.sleep(4)
+            time.sleep(6)
 
     except Exception as e:
-        print(f"❌ Hata: {e}")
+        print(f"❌ Genel Hata: {e}")
 
 if __name__ == "__main__":
-    print("🚀 The Assembly RSS Bot BAŞLATILDI")
-    print(f"RSS: {RSS_URL[:70]}...")
+    print("🚀 The Assembly Grok AI Botu BAŞLATILDI")
+    print(f"RSS: {RSS_URL[:60]}...")
     
     while True:
         check_new_posts()
