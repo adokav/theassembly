@@ -26,7 +26,40 @@ logging.basicConfig(
 log = logging.getLogger("assembly-bot")
 
 TOKEN = os.getenv("TELEGRAM_TOKEN")
-XAI_API_KEY = os.getenv("XAI_API_KEY")
+
+# --- LLM provider (OpenAI-compatible) ---------------------------------------
+# The bot talks to any OpenAI-compatible API. Choose a provider purely via env;
+# no code change needed to switch between OpenAI / xAI / Groq / DeepSeek / etc.
+#
+#   Generic (any provider):  LLM_API_KEY, LLM_BASE_URL, LLM_MODEL
+#   Shortcuts (auto-detect): OPENAI_API_KEY  -> OpenAI
+#                            XAI_API_KEY     -> xAI (Grok)
+_env_llm_key = os.getenv("LLM_API_KEY")
+_env_openai_key = os.getenv("OPENAI_API_KEY")
+_env_xai_key = os.getenv("XAI_API_KEY")
+_env_base_url = (os.getenv("LLM_BASE_URL") or "").strip() or None
+_env_model = (os.getenv("LLM_MODEL") or "").strip() or None
+
+if _env_llm_key:
+    LLM_PROVIDER = "custom"
+    LLM_API_KEY = _env_llm_key
+    LLM_BASE_URL = _env_base_url
+    LLM_MODEL = _env_model or "gpt-4o-mini"
+elif _env_openai_key:
+    LLM_PROVIDER = "openai"
+    LLM_API_KEY = _env_openai_key
+    LLM_BASE_URL = _env_base_url  # None -> OpenAI default endpoint
+    LLM_MODEL = _env_model or "gpt-4o-mini"
+elif _env_xai_key:
+    LLM_PROVIDER = "xai"
+    LLM_API_KEY = _env_xai_key
+    LLM_BASE_URL = _env_base_url or "https://api.x.ai/v1"
+    LLM_MODEL = _env_model or "grok-4"
+else:
+    LLM_PROVIDER = None
+    LLM_API_KEY = None
+    LLM_BASE_URL = None
+    LLM_MODEL = None
 
 # Primary RSS source + optional comma-separated fallback mirrors.
 # Example: RSS_FALLBACK_URLS="https://mirror1/feed,https://mirror2/feed"
@@ -62,7 +95,12 @@ def _require(name, value):
 def validate_config():
     ok = True
     ok &= _require("TELEGRAM_TOKEN", TOKEN)
-    ok &= _require("XAI_API_KEY", XAI_API_KEY)
+    if not LLM_API_KEY:
+        log.error(
+            "Eksik LLM anahtarı: OPENAI_API_KEY, XAI_API_KEY veya LLM_API_KEY'den "
+            "en az biri tanımlı olmalı."
+        )
+        ok = False
     if not RSS_URLS:
         log.error("Eksik ortam değişkeni: RSS_URL (en az bir RSS adresi gerekli)")
         ok = False
@@ -73,8 +111,11 @@ def validate_config():
 
 validate_config()
 
+log.info("LLM sağlayıcı: %s | model: %s%s", LLM_PROVIDER, LLM_MODEL,
+         f" | base_url: {LLM_BASE_URL}" if LLM_BASE_URL else "")
+
 bot = telebot.TeleBot(TOKEN)
-client = OpenAI(api_key=XAI_API_KEY, base_url="https://api.x.ai/v1")
+client = OpenAI(api_key=LLM_API_KEY, base_url=LLM_BASE_URL)
 
 
 # ---------------------------------------------------------------------------
@@ -196,7 +237,7 @@ Paylaşımlarda somut bir yatırım sinyali yoksa "Bu dönemde belirgin bir yat�
 
     try:
         response = client.chat.completions.create(
-            model="grok-4",
+            model=LLM_MODEL,
             messages=[
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
@@ -206,8 +247,16 @@ Paylaşımlarda somut bir yatırım sinyali yoksa "Bu dönemde belirgin bir yat�
         )
         return response.choices[0].message.content
     except Exception as e:  # noqa: BLE001
-        log.exception("Grok API hatası")
-        return f"❌ Grok API hatası: {str(e)[:200]}"
+        log.exception("LLM analiz hatası (%s/%s)", LLM_PROVIDER, LLM_MODEL)
+        msg = str(e)
+        low = msg.lower()
+        if "403" in msg or "credit" in low or "permission" in low or "quota" in low or "insufficient" in low:
+            return (
+                f"❌ Yapay zeka sağlayıcısı ({LLM_PROVIDER}) isteği reddetti: kredi/limit "
+                f"veya yetki sorunu görünüyor. Hesabınızda bakiye olduğundan ve API "
+                f"anahtarının doğru olduğundan emin olun.\n\nDetay: {msg[:200]}"
+            )
+        return f"❌ Yapay zeka analiz hatası ({LLM_PROVIDER}/{LLM_MODEL}): {msg[:200]}"
 
 
 # ---------------------------------------------------------------------------
