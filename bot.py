@@ -1,23 +1,20 @@
 import os
 import time
 import feedparser
-import telegram
+import telebot
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from openai import OpenAI
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler
+from telebot import types
 
 load_dotenv()
 
-import nest_asyncio
-nest_asyncio.apply()
-
 # ====================== CONFIG ======================
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TOKEN = os.getenv("TELEGRAM_TOKEN")
 RSS_URL = os.getenv("RSS_URL")
 XAI_API_KEY = os.getenv("XAI_API_KEY")
 
+bot = telebot.TeleBot(TOKEN)
 client = OpenAI(api_key=XAI_API_KEY, base_url="https://api.x.ai/v1")
 
 def get_recent_posts(days: int):
@@ -33,19 +30,19 @@ def get_recent_posts(days: int):
                     "summary": entry.get('summary', '')[:700],
                     "link": entry.link
                 })
-    return posts
+    return posts[:25]
 
-async def analyze_posts(posts, period_text):
+def analyze_posts(posts, period_text):
     if not posts:
         return "Bu dönemde veri bulunamadı."
 
-    text = "\n\n".join([f"Başlık: {p['title']}\nÖzet: {p['summary']}" for p in posts[:25]])
+    text = "\n\n".join([f"Başlık: {p['title']}\nÖzet: {p['summary']}" for p in posts])
 
     try:
         response = client.chat.completions.create(
             model="grok-4",
             messages=[
-                {"role": "system", "content": "Sen profesyonel bir makro analist ve trading stratejistisin. Türkçe, net, aksiyon odaklı ve stratejik rapor yaz."},
+                {"role": "system", "content": "Sen profesyonel bir makro analist ve trading stratejistisin. Türkçe, net ve aksiyon odaklı rapor yaz."},
                 {"role": "user", "content": f"""
 The Assembly (@InTheAssembly) hesabının **{period_text}** içindeki paylaşımlarını analiz et.
 
@@ -64,56 +61,49 @@ Rapor formatı:
         )
         return response.choices[0].message.content
     except Exception as e:
-        return f"❌ Grok API hatası: {e}"
+        return f"❌ Grok API hatası: {str(e)[:200]}"
 
-async def show_report(update, context, days):
-    query = update.callback_query
-    await query.answer()
+@bot.message_handler(commands=['start', 'rapor'])
+def send_menu(message):
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    markup.add(types.InlineKeyboardButton("🔥 Son 1 Gün", callback_data="1"))
+    markup.add(types.InlineKeyboardButton("🔥 Son 2 Gün", callback_data="2"))
+    markup.add(types.InlineKeyboardButton("🔥 Son 3 Gün", callback_data="3"))
+    markup.add(types.InlineKeyboardButton("📅 Son 1 Hafta", callback_data="7"))
+    markup.add(types.InlineKeyboardButton("📅 Son 2 Hafta", callback_data="14"))
+    markup.add(types.InlineKeyboardButton("📊 Geçtiğimiz Ay", callback_data="30"))
 
-    period_text = f"Son {days} Gün" if days <= 3 else f"Son {days//7} Hafta" if days <= 14 else "Geçtiğimiz Ay"
-    
-    await query.edit_message_text("🔄 Grok AI analiz yapıyor, lütfen bekleyin... (10-15 sn)")
-
-    posts = get_recent_posts(days)
-    analysis = await analyze_posts(posts, period_text)
-
-    message = f"📊 **The Assembly - {period_text} Stratejik Rapor**\n\n"
-    message += analysis
-
-    await query.edit_message_text(message, parse_mode='Markdown')
-
-async def start(update, context):
-    keyboard = [
-        [InlineKeyboardButton("🔥 Son 1 Gün", callback_data="1")],
-        [InlineKeyboardButton("🔥 Son 2 Gün", callback_data="2")],
-        [InlineKeyboardButton("🔥 Son 3 Gün", callback_data="3")],
-        [InlineKeyboardButton("📅 Son 1 Hafta", callback_data="7")],
-        [InlineKeyboardButton("📅 Son 2 Hafta", callback_data="14")],
-        [InlineKeyboardButton("📊 Geçtiğimiz Ay", callback_data="30")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    await update.message.reply_text(
-        "🎯 **The Assembly Stratejik Rapor Botu**\n\n"
-        "Hangi dönemi analiz etmek istersin?",
-        reply_markup=reply_markup
+    bot.send_message(
+        message.chat.id,
+        "🎯 **The Assembly Stratejik Rapor Botu**\n\nHangi dönemi analiz etmek istersin?",
+        reply_markup=markup,
+        parse_mode="Markdown"
     )
 
-async def button_handler(update, context):
-    query = update.callback_query
-    days = int(query.data)
-    await show_report(update, context, days)
+@bot.callback_query_handler(func=lambda call: True)
+def callback_handler(call):
+    days = int(call.data)
+    period_text = f"Son {days} Gün" if days <= 3 else f"Son {days//7} Hafta" if days <= 14 else "Geçtiğimiz Ay"
 
-def main():
-    application = Application.builder().token(TELEGRAM_TOKEN).build()
+    bot.edit_message_text(
+        chat_id=call.message.chat.id,
+        message_id=call.message.message_id,
+        text="🔄 Grok AI analiz yapıyor... (10-20 saniye sürebilir)"
+    )
 
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("rapor", start))
-    application.add_handler(CallbackQueryHandler(button_handler))
+    posts = get_recent_posts(days)
+    analysis = analyze_posts(posts, period_text)
 
-    print("🚀 Butonlu Grok AI Botu BAŞLATILDI")
-    print("Telegram’da /start veya /rapor yazarak butonları açabilirsiniz.")
-    application.run_polling()
+    result = f"📊 **The Assembly - {period_text} Stratejik Rapor**\n\n{analysis}"
+    
+    bot.edit_message_text(
+        chat_id=call.message.chat.id,
+        message_id=call.message.message_id,
+        text=result,
+        parse_mode="Markdown"
+    )
 
 if __name__ == "__main__":
-    main()
+    print("🚀 The Assembly Butonlu Grok AI Botu BAŞLATILDI")
+    print("Telegram’da /start veya /rapor yazarak menüyü açabilirsiniz.")
+    bot.infinity_polling()
