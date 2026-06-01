@@ -9,7 +9,6 @@ from telebot import types
 
 load_dotenv()
 
-# ====================== CONFIG ======================
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 RSS_URL = os.getenv("RSS_URL")
 XAI_API_KEY = os.getenv("XAI_API_KEY")
@@ -35,23 +34,23 @@ def get_recent_posts(days: int):
 def analyze_posts(posts, period_text):
     if not posts:
         return "Bu dönemde veri bulunamadı."
-
+    
     text = "\n\n".join([f"Başlık: {p['title']}\nÖzet: {p['summary']}" for p in posts])
-
+    
     try:
         response = client.chat.completions.create(
             model="grok-4",
             messages=[
                 {"role": "system", "content": "Sen profesyonel bir makro analist ve trading stratejistisin. Türkçe, net ve aksiyon odaklı rapor yaz."},
                 {"role": "user", "content": f"""
-The Assembly (@InTheAssembly) hesabının **{period_text}** içindeki paylaşımlarını analiz et.
+The Assembly hesabının **{period_text}** içindeki paylaşımlarını analiz et.
 
 Posts:
 {text}
 
 Rapor formatı:
 • **Önerilen Hisseler / Varlıklar**
-• **Her birinin neden önerildiği (katalizör, makro olay, piyasa yapısı)**
+• **Her birinin neden önerildiği**
 • **Zamanlama ve Risk Seviyesi**
 • **Genel Stratejik Tavsiye**
                 """}
@@ -73,37 +72,21 @@ def send_menu(message):
     markup.add(types.InlineKeyboardButton("📅 Son 2 Hafta", callback_data="14"))
     markup.add(types.InlineKeyboardButton("📊 Geçtiğimiz Ay", callback_data="30"))
 
-    bot.send_message(
-        message.chat.id,
-        "🎯 **The Assembly Stratejik Rapor Botu**\n\nHangi dönemi analiz etmek istersin?",
-        reply_markup=markup,
-        parse_mode="Markdown"
-    )
+    bot.send_message(message.chat.id, "🎯 **The Assembly Stratejik Rapor Botu**\n\nHangi dönemi analiz etmek istersin?", reply_markup=markup, parse_mode="Markdown")
 
 @bot.callback_query_handler(func=lambda call: True)
 def callback_handler(call):
     days = int(call.data)
     period_text = f"Son {days} Gün" if days <= 3 else f"Son {days//7} Hafta" if days <= 14 else "Geçtiğimiz Ay"
 
-    bot.edit_message_text(
-        chat_id=call.message.chat.id,
-        message_id=call.message.message_id,
-        text="🔄 Grok AI analiz yapıyor... (10-20 saniye sürebilir)"
-    )
+    bot.edit_message_text("🔄 Grok AI analiz yapıyor... (10-20 sn)", call.message.chat.id, call.message.message_id)
 
     posts = get_recent_posts(days)
     analysis = analyze_posts(posts, period_text)
 
     result = f"📊 **The Assembly - {period_text} Stratejik Rapor**\n\n{analysis}"
-    
-    bot.edit_message_text(
-        chat_id=call.message.chat.id,
-        message_id=call.message.message_id,
-        text=result,
-        parse_mode="Markdown"
-    )
+    bot.edit_message_text(result, call.message.chat.id, call.message.message_id, parse_mode="Markdown")
 
 if __name__ == "__main__":
     print("🚀 The Assembly Butonlu Grok AI Botu BAŞLATILDI")
-    print("Telegram’da /start veya /rapor yazarak menüyü açabilirsiniz.")
     bot.infinity_polling()
