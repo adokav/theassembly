@@ -34,6 +34,8 @@ RSS_URLS = [u for u in ([_primary_rss] + _fallback_rss) if u]
 
 # Maximum Telegram message length is 4096; leave headroom for headers/markup.
 TELEGRAM_LIMIT = 3900
+# Turkey is permanently UTC+3 (no DST since 2016); used to show post times in TSİ.
+TR_OFFSET = timedelta(hours=3)
 HTTP_TIMEOUT = 20
 HTTP_RETRIES = 4
 USER_AGENT = (
@@ -138,11 +140,12 @@ def get_recent_posts(days):
             continue
         pub_date = datetime.utcfromtimestamp(calendar.timegm(published))
         if pub_date > cutoff:
+            tr_date = pub_date + TR_OFFSET
             posts.append({
                 "title": entry.get("title", "").strip(),
                 "text": _entry_text(entry),
                 "link": entry.get("link", ""),
-                "date": pub_date.strftime("%Y-%m-%d %H:%M UTC"),
+                "date": tr_date.strftime("%d.%m.%Y %H:%M TSİ"),
             })
     return posts[:40], None
 
@@ -163,21 +166,29 @@ def analyze_posts(posts, period_text):
         "Sen profesyonel bir makro analist ve trading stratejistisin. "
         "Türkçe, net ve aksiyon odaklı yazarsın. "
         "ÇOK ÖNEMLİ: Yalnızca sana verilen paylaşımlarda AÇIKÇA geçen hisse, kripto ve "
-        "varlıkları kullan. Paylaşımlarda olmayan bir varlık, fiyat ya da seviye UYDURMA. "
-        "Bir paylaşımda net bir öneri yoksa bunu açıkça belirt."
+        "varlıkları kullan. Paylaşımlarda olmayan bir varlık, fiyat, seviye ya da TARİH "
+        "UYDURMA. Her öneri için, o önerinin geçtiği paylaşımın sana verilen TARİH ve "
+        "SAATİNİ ('Tarih: ...' satırından) aynen kullan. Bir paylaşımda net bir öneri "
+        "yoksa bunu açıkça belirt."
     )
 
     user = f"""The Assembly hesabının **{period_text}** içindeki paylaşımlarını analiz et.
 
-Aşağıdaki {len(posts)} paylaşım gerçek veridir:
+Aşağıdaki {len(posts)} paylaşım gerçek veridir. Her paylaşımın başında o paylaşımın
+gerçek tarih ve saati (TSİ) yer alır:
 
 {text}
 
-Raporu şu formatta yaz:
-• **Öne Çıkan Hisseler / Varlıklar** (yalnızca paylaşımlarda geçenler)
-• **Her birinin neden gündeme geldiği** (ilgili paylaşıma atıfla)
-• **Zamanlama ve Risk Seviyesi**
-• **Genel Stratejik Görünüm**
+Raporu şu formatta yaz. Tespit ettiğin HER tavsiye/varlık için ayrı bir madde aç:
+
+**1. <Varlık / Hisse adı>**
+   • 🗓 *Tarih/Saat:* <önerinin geçtiği paylaşımın tarih ve saati (TSİ)>
+   • 💡 *Tavsiye:* <al / sat / izle / kısa-uzun pozisyon vb. — paylaşımda ne dendiyse>
+   • 🧭 *Gerekçe:* <bu varlığın neden öne çıktığının paylaşıma dayalı açıklaması>
+   • ⚠️ *Zamanlama & Risk:* <kısa risk/zamanlama notu>
+
+Tüm maddelerden sonra:
+**📌 Genel Stratejik Görünüm:** <2-3 cümlelik özet>
 
 Paylaşımlarda somut bir yatırım sinyali yoksa "Bu dönemde belirgin bir yatırım sinyali tespit edilmedi" yaz."""
 
