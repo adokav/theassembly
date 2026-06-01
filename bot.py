@@ -77,4 +77,4 @@ if __name__ == "__main__":
     
     while True:
         check_new_posts()
-        time.sleep(300)  # 5 dakikada bir kontrol
+        time.sleep(300)
