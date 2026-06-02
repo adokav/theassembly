@@ -313,7 +313,12 @@ def _menu_markup():
     return markup
 
 
-def show_menu(chat_id, title="🎯 *The Assembly Stratejik Rapor Botu*\n\nHangi dönemi analiz etmek istersin?"):
+def show_menu(chat_id, title=None):
+    if title is None:
+        title = "🎯 *The Assembly Stratejik Rapor Botu*\n\nHangi dönemi analiz etmek istersin?"
+    # Show the active AI provider/model so the running config is visible at a
+    # glance in Telegram (no log digging needed when debugging deploys).
+    title += f"\n\n🤖 _Aktif AI: {LLM_PROVIDER} · {LLM_MODEL}_"
     bot.send_message(chat_id, title, reply_markup=_menu_markup(), parse_mode="Markdown")
 
 
