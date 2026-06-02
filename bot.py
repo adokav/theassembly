@@ -1,5 +1,7 @@
 import os
+import re
 import sys
+import json
 import time
 import logging
 import calendar
@@ -194,63 +196,211 @@ def get_recent_posts(days):
 
 
 # ---------------------------------------------------------------------------
-# Analysis (Grok) — grounded to the actual posts
+# Analysis: structured extraction -> live market enrichment -> graded report
 # ---------------------------------------------------------------------------
-def analyze_posts(posts, period_text):
-    if not posts:
-        return "Bu dönemde analiz edilecek paylaşım bulunamadı."
+def _llm_chat(messages, max_tokens=1500, temperature=0.4, json_mode=False):
+    kwargs = dict(model=LLM_MODEL, messages=messages,
+                  temperature=temperature, max_tokens=max_tokens)
+    if json_mode:
+        try:
+            return client.chat.completions.create(
+                response_format={"type": "json_object"}, **kwargs
+            ).choices[0].message.content
+        except Exception:  # model may not support response_format; retry plain
+            pass
+    return client.chat.completions.create(**kwargs).choices[0].message.content
 
+
+def _parse_json(raw):
+    """Parse LLM output as JSON, tolerating surrounding prose/code fences."""
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except Exception:
+        pass
+    m = re.search(r"\{.*\}", raw, re.DOTALL)
+    if m:
+        try:
+            return json.loads(m.group(0))
+        except Exception:
+            return None
+    return None
+
+
+def extract_recommendations(posts):
+    """Pass 1: pull concrete, grounded recommendations as structured JSON."""
+    text = "\n\n".join(
+        f"[{i+1}] Tarih: {p['date']}\nBaşlık: {p['title']}\nİçerik: {p['text']}"
+        for i, p in enumerate(posts)
+    )
+    system = ("Sen bir finansal metin çıkarım motorusun. SADECE geçerli JSON döndür. "
+              "Paylaşımlarda olmayan hiçbir varlık, fiyat veya tarih uydurma.")
+    user = f"""Aşağıdaki paylaşımlardan SOMUT hisse/varlık tavsiyelerini çıkar.
+Sadece ABD/global borsalarda işlem gören hisseler için Yahoo Finance sembolü ver
+(ör. Apple -> AAPL, Nvidia -> NVDA). Net sembol çıkaramıyorsan o kaydı atla.
+
+JSON şeması:
+{{"recommendations": [
+  {{"asset": "şirket adı", "ticker": "AAPL", "action": "al|sat|izle",
+    "date": "GG.AA.YYYY", "entry_price": null, "target": null,
+    "conviction": "yüksek|orta|düşük", "thesis": "kısa gerekçe",
+    "source_quote": "ilgili alıntı"}}
+]}}
+
+Paylaşımlar:
+{text}
+
+Yalnızca JSON döndür."""
+    raw = _llm_chat(
+        [{"role": "system", "content": system}, {"role": "user", "content": user}],
+        max_tokens=1500, temperature=0.2, json_mode=True,
+    )
+    data = _parse_json(raw) or {}
+    recs = data.get("recommendations", [])
+    return recs if isinstance(recs, list) else []
+
+
+def fetch_quote(ticker):
+    """Live market data from Yahoo Finance chart JSON (no heavy deps).
+    Returns dict with current price, 50d MA, 52w hi/lo and (ts, close) pairs."""
+    try:
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
+        resp = requests.get(
+            url, params={"range": "1y", "interval": "1d"},
+            headers={"User-Agent": USER_AGENT}, timeout=HTTP_TIMEOUT,
+        )
+        resp.raise_for_status()
+        res = resp.json()["chart"]["result"][0]
+        meta = res.get("meta", {}) or {}
+        ts = res.get("timestamp", []) or []
+        closes = (res.get("indicators", {}).get("quote", [{}])[0].get("close", []) or [])
+        pairs = [(t, c) for t, c in zip(ts, closes) if c is not None]
+        if not pairs:
+            return None
+        closes_only = [c for _, c in pairs]
+        current = meta.get("regularMarketPrice") or closes_only[-1]
+        ma50 = sum(closes_only[-50:]) / min(len(closes_only), 50)
+        return {
+            "current": current, "ma50": ma50,
+            "high52": max(closes_only), "low52": min(closes_only),
+            "currency": meta.get("currency", ""), "pairs": pairs,
+        }
+    except Exception as e:  # noqa: BLE001
+        log.warning("Fiyat alınamadı (%s): %s", ticker, str(e)[:120])
+        return None
+
+
+def _price_on_or_before(pairs, date_str):
+    try:
+        target = datetime.strptime(date_str, "%d.%m.%Y").timestamp() + 86400
+    except Exception:
+        return None
+    chosen = None
+    for t, c in pairs:
+        if t <= target:
+            chosen = c
+        else:
+            break
+    return chosen
+
+
+def enrich_recommendations(recs):
+    """Attach live market context to each recommendation that has a ticker."""
+    for r in recs[:10]:
+        tk = (r.get("ticker") or "").strip().upper()
+        if not tk:
+            r["market"] = None
+            continue
+        q = fetch_quote(tk)
+        if not q:
+            r["market"] = None
+            continue
+        entry = _price_on_or_before(q["pairs"], r.get("date", "")) or r.get("entry_price")
+        cur = q["current"]
+        chg = ((cur - entry) / entry * 100) if entry else None
+        r["market"] = {
+            "current": round(cur, 2),
+            "entry_then": round(entry, 2) if entry else None,
+            "pct_change": round(chg, 1) if chg is not None else None,
+            "ma50": round(q["ma50"], 2),
+            "high52": round(q["high52"], 2),
+            "low52": round(q["low52"], 2),
+            "currency": q["currency"],
+        }
+    return recs
+
+
+def build_report_with_market(recs, period_text):
+    """Pass 2: turn enriched structured data into a graded, Turkish report."""
+    payload = json.dumps({"period": period_text, "recommendations": recs}, ensure_ascii=False)
+    system = ("Sen profesyonel bir trading stratejistisin. Türkçe, net yazarsın. "
+              "Sana verilen yapılandırılmış veriyi ve GÜNCEL piyasa fiyatlarını kullan; "
+              "fiyat veya tarih UYDURMA. market alanı null ise fiyat yorumu yapma.")
+    user = f"""Aşağıda The Assembly hesabının {period_text} içindeki tavsiyeleri ve her biri
+için güncel piyasa verisi (JSON) var:
+
+{payload}
+
+Her tavsiye için tam olarak şu formatta yaz:
+
+**<asset> ({{ticker}})**
+• 🗓 Tavsiye: <date> — <action>
+• 🧭 Gerekçe: <thesis>
+• 💰 O günden bugüne: giriş ~<entry_then> → güncel <current> (<pct_change>%); 50G ort: <ma50>; 52H: <low52>–<high52>
+• 🚦 *BUGÜN ALINIR MI?*: 🟢 Hâlâ geçerli / 🟡 Kısmen / 🔴 Geç kalındı–Geçersiz — <gerekçe: güncel fiyat girişe ve 50G ortalamaya göre nerede, tez bozuldu mu, önerilen yeni giriş/stop>
+
+Karar mantığı: fiyat girişe yakın/altında ve tez sağlamsa 🟢; bir miktar kaçmış ama makulse 🟡;
+hedefi çoktan aşmış, 52H zirveye yapışmış ya da tez geçersizse 🔴.
+market null ise: "Fiyat verisi alınamadı, güncel değerlendirme yapılamadı" yaz.
+
+Sonda: **📌 Genel Görünüm** (2-3 cümle)."""
+    return _llm_chat(
+        [{"role": "system", "content": system}, {"role": "user", "content": user}],
+        max_tokens=1900, temperature=0.4,
+    )
+
+
+def _analyze_legacy(posts, period_text):
+    """Single-pass, text-only report. Fallback when structured extraction fails."""
     text = "\n\n".join(
         f"[{i+1}] Tarih: {p['date']}\nBaşlık: {p['title']}\nİçerik: {p['text']}\nLink: {p['link']}"
         for i, p in enumerate(posts)
     )
-
     system = (
         "Sen profesyonel bir makro analist ve trading stratejistisin. "
         "Türkçe, net ve aksiyon odaklı yazarsın. "
         "ÇOK ÖNEMLİ: Yalnızca sana verilen paylaşımlarda AÇIKÇA geçen hisse, kripto ve "
         "varlıkları kullan. Paylaşımlarda olmayan bir varlık, fiyat, seviye ya da TARİH "
-        "UYDURMA. Her öneri için, o önerinin geçtiği paylaşımın sana verilen TARİH ve "
-        "SAATİNİ ('Tarih: ...' satırından) aynen kullan. Bir paylaşımda net bir öneri "
-        "yoksa bunu açıkça belirt."
+        "UYDURMA. Her öneri için, o önerinin geçtiği paylaşımın TARİH ve SAATİNİ aynen kullan."
     )
-
     user = f"""The Assembly hesabının **{period_text}** içindeki paylaşımlarını analiz et.
-
-Aşağıdaki {len(posts)} paylaşım gerçek veridir. Her paylaşımın başında o paylaşımın
-gerçek tarih ve saati (TSİ) yer alır:
 
 {text}
 
-Raporu şu formatta yaz. Tespit ettiğin HER tavsiye/varlık için ayrı bir madde aç:
+Her tavsiye için: **Varlık** · 🗓 Tarih/Saat · 💡 Tavsiye · 🧭 Gerekçe · ⚠️ Risk.
+Sonda: **📌 Genel Stratejik Görünüm**.
+Somut sinyal yoksa "Bu dönemde belirgin bir yatırım sinyali tespit edilmedi" yaz."""
+    return _llm_chat(
+        [{"role": "system", "content": system}, {"role": "user", "content": user}],
+        max_tokens=1500, temperature=0.4,
+    )
 
-**1. <Varlık / Hisse adı>**
-   • 🗓 *Tarih/Saat:* <önerinin geçtiği paylaşımın tarih ve saati (TSİ)>
-   • 💡 *Tavsiye:* <al / sat / izle / kısa-uzun pozisyon vb. — paylaşımda ne dendiyse>
-   • 🧭 *Gerekçe:* <bu varlığın neden öne çıktığının paylaşıma dayalı açıklaması>
-   • ⚠️ *Zamanlama & Risk:* <kısa risk/zamanlama notu>
 
-Tüm maddelerden sonra:
-**📌 Genel Stratejik Görünüm:** <2-3 cümlelik özet>
-
-Paylaşımlarda somut bir yatırım sinyali yoksa "Bu dönemde belirgin bir yatırım sinyali tespit edilmedi" yaz."""
-
+def analyze_posts(posts, period_text):
+    if not posts:
+        return "Bu dönemde analiz edilecek paylaşım bulunamadı."
     try:
-        response = client.chat.completions.create(
-            model=LLM_MODEL,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            temperature=0.4,
-            max_tokens=1500,
-        )
-        return response.choices[0].message.content
+        recs = extract_recommendations(posts)
+        if recs:
+            enrich_recommendations(recs)
+            return build_report_with_market(recs, period_text)
+        return _analyze_legacy(posts, period_text)
     except Exception as e:  # noqa: BLE001
         log.exception("LLM analiz hatası (%s/%s)", LLM_PROVIDER, LLM_MODEL)
         msg = str(e)
         low = msg.lower()
-        if "403" in msg or "credit" in low or "permission" in low or "quota" in low or "insufficient" in low:
+        if any(k in low for k in ("403", "credit", "permission", "quota", "insufficient")):
             return (
                 f"❌ Yapay zeka sağlayıcısı ({LLM_PROVIDER}) isteği reddetti: kredi/limit "
                 f"veya yetki sorunu görünüyor. Hesabınızda bakiye olduğundan ve API "

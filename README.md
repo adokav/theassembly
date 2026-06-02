@@ -5,7 +5,11 @@ analiz eden ve Telegram üzerinden **hisse / yatırım stratejisi raporu** üret
 
 ## Özellikler
 - Buton menüsünden dönem seçimi (Son 1/2/3 gün, 1/2 hafta, son ay)
-- Grok AI ile paylaşımlara **dayalı** (uydurma yapmayan) stratejik analiz
+- Yapay zeka ile paylaşımlara **dayalı** (uydurma yapmayan) stratejik analiz
+- **Yapılandırılmış çıkarım + canlı piyasa verisi:** her tavsiye için sembol, tarih,
+  gerekçe çıkarılır; Yahoo Finance'ten güncel fiyat / 50G ort. / 52H aralık çekilir
+- **"Bugün alınır mı?" kararı:** geçmiş tavsiye, o günden bugüne fiyat hareketiyle
+  karşılaştırılıp 🟢 geçerli / 🟡 kısmen / 🔴 geç kalındı olarak derecelendirilir
 - Sağlam RSS çekimi: yeniden deneme (exponential backoff) + yedek ayna (mirror) desteği
 - Güvenli Telegram gönderimi: 4096 karakter sınırı için otomatik bölme,
   Markdown hatasında düz metne otomatik geçiş
