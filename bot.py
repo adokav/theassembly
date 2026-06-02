@@ -327,6 +327,21 @@ def send_menu(message):
     show_menu(message.chat.id)
 
 
+@bot.message_handler(commands=["diag"])
+def send_diag(message):
+    """Show what env the RUNNING process actually sees (no secret values)."""
+    lines = ["🔧 *Tanılama — botun gördüğü ortam*", ""]
+    for k in ["LLM_API_KEY", "OPENAI_API_KEY", "XAI_API_KEY"]:
+        v = os.getenv(k)
+        lines.append(f"`{k}`: {'✅ VAR (uzunluk ' + str(len(v)) + ')' if v else '❌ YOK'}")
+    for k in ["LLM_BASE_URL", "LLM_MODEL"]:
+        v = os.getenv(k)
+        lines.append(f"`{k}`: {('✅ ' + v) if v else '❌ YOK'}")
+    lines.append("")
+    lines.append(f"🤖 Aktif sağlayıcı: *{LLM_PROVIDER}* · `{LLM_MODEL}`")
+    bot.send_message(message.chat.id, "\n".join(lines), parse_mode="Markdown")
+
+
 def _period_text(days):
     if days <= 3:
         return f"Son {days} Gün"
