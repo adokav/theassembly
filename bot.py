@@ -302,8 +302,7 @@ def safe_send(chat_id, text, edit_message_id=None):
 # ---------------------------------------------------------------------------
 # Telegram handlers
 # ---------------------------------------------------------------------------
-@bot.message_handler(commands=["start", "rapor"])
-def send_menu(message):
+def _menu_markup():
     markup = types.InlineKeyboardMarkup(row_width=1)
     markup.add(types.InlineKeyboardButton("🔥 Son 1 Gün", callback_data="1"))
     markup.add(types.InlineKeyboardButton("🔥 Son 2 Gün", callback_data="2"))
@@ -311,13 +310,36 @@ def send_menu(message):
     markup.add(types.InlineKeyboardButton("📅 Son 1 Hafta", callback_data="7"))
     markup.add(types.InlineKeyboardButton("📅 Son 2 Hafta", callback_data="14"))
     markup.add(types.InlineKeyboardButton("📊 Geçtiğimiz Ay", callback_data="30"))
+    return markup
 
-    bot.send_message(
-        message.chat.id,
-        "🎯 *The Assembly Stratejik Rapor Botu*\n\nHangi dönemi analiz etmek istersin?",
-        reply_markup=markup,
-        parse_mode="Markdown",
-    )
+
+def show_menu(chat_id, title=None):
+    if title is None:
+        title = "🎯 *The Assembly Stratejik Rapor Botu*\n\nHangi dönemi analiz etmek istersin?"
+    # Show the active AI provider/model so the running config is visible at a
+    # glance in Telegram (no log digging needed when debugging deploys).
+    title += f"\n\n🤖 _Aktif AI: {LLM_PROVIDER} · {LLM_MODEL}_"
+    bot.send_message(chat_id, title, reply_markup=_menu_markup(), parse_mode="Markdown")
+
+
+@bot.message_handler(commands=["start", "rapor"])
+def send_menu(message):
+    show_menu(message.chat.id)
+
+
+@bot.message_handler(commands=["diag"])
+def send_diag(message):
+    """Show what env the RUNNING process actually sees (no secret values)."""
+    lines = ["🔧 *Tanılama — botun gördüğü ortam*", ""]
+    for k in ["LLM_API_KEY", "OPENAI_API_KEY", "XAI_API_KEY"]:
+        v = os.getenv(k)
+        lines.append(f"`{k}`: {'✅ VAR (uzunluk ' + str(len(v)) + ')' if v else '❌ YOK'}")
+    for k in ["LLM_BASE_URL", "LLM_MODEL"]:
+        v = os.getenv(k)
+        lines.append(f"`{k}`: {('✅ ' + v) if v else '❌ YOK'}")
+    lines.append("")
+    lines.append(f"🤖 Aktif sağlayıcı: *{LLM_PROVIDER}* · `{LLM_MODEL}`")
+    bot.send_message(message.chat.id, "\n".join(lines), parse_mode="Markdown")
 
 
 def _period_text(days):
@@ -339,9 +361,11 @@ def callback_handler(call):
     days = int(call.data)
     period_text = _period_text(days)
     chat_id = call.message.chat.id
-    msg_id = call.message.message_id
 
-    bot.edit_message_text("🔄 Grok AI analiz yapıyor... (10-30 sn)", chat_id, msg_id)
+    # Keep the menu (call.message) intact so the buttons stay clickable.
+    # Use a separate status message that we then turn into the report.
+    status = bot.send_message(chat_id, "🔄 Yapay zeka analiz yapıyor... (10-30 sn)")
+    status_id = status.message_id
 
     posts, error = get_recent_posts(days)
 
@@ -349,8 +373,9 @@ def callback_handler(call):
         bot.edit_message_text(
             "⚠️ Paylaşım kaynağına (RSS) şu anda ulaşılamıyor. "
             "Kaynak geçici olarak kapalı olabilir; lütfen birazdan tekrar deneyin.",
-            chat_id, msg_id,
+            chat_id, status_id,
         )
+        show_menu(chat_id, "🎯 Tekrar denemek için bir dönem seç:")
         return
 
     analysis = analyze_posts(posts, period_text)
@@ -361,7 +386,10 @@ def callback_handler(call):
         header += "\n"
 
     result = header + analysis + DISCLAIMER
-    safe_send(chat_id, result, edit_message_id=msg_id)
+    safe_send(chat_id, result, edit_message_id=status_id)
+
+    # Re-show the menu at the bottom so a new period is one tap away.
+    show_menu(chat_id, "🎯 Başka bir dönem seçebilirsin:")
 
 
 class _HealthHandler(BaseHTTPRequestHandler):
