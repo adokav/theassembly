@@ -12,6 +12,7 @@ from datetime import datetime, timedelta
 import requests
 import feedparser
 import telebot
+from telebot.apihelper import ApiTelegramException
 from dotenv import load_dotenv
 from openai import OpenAI
 from telebot import types
@@ -675,8 +676,31 @@ if __name__ == "__main__":
     except Exception as e:  # noqa: BLE001
         log.warning("Komut menüsü ayarlanamadı: %s", str(e)[:160])
 
-    log.info("🚀 The Assembly Grok AI Botu BAŞLATILDI (%d RSS kaynağı yapılandırıldı)", len(RSS_URLS))
-    # skip_pending: ignore the backlog accrued while the bot was offline.
-    # If a second instance runs the same token, Telegram returns 409 — that is
-    # now logged (above) instead of being invisible.
-    bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=30)
+    log.info("🚀 Bot BAŞLATILDI (%d hesap takip ediliyor)", len(ACCOUNTS))
+
+    # Resilient polling loop. The most common failure is 409 Conflict: during a
+    # Render deploy the old instance is still polling while the new one starts,
+    # so two getUpdates calls briefly fight over the same token. Instead of
+    # crashing (and getting force-restarted), we wait and retry — once the old
+    # instance is gone the conflict clears and polling resumes on its own.
+    backoff = 5
+    while True:
+        try:
+            # skip_pending: drop the backlog accrued while the bot was offline.
+            bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=30)
+            backoff = 5  # clean return is rare; reset and loop again
+        except ApiTelegramException as e:
+            if getattr(e, "error_code", None) == 409:
+                log.warning(
+                    "409 Conflict: aynı token ile başka bir kopya dinliyor "
+                    "(genelde deploy sırasında eski kopya). %d sn beklenip denenecek.",
+                    backoff,
+                )
+            else:
+                log.warning("Telegram API hatası; %d sn sonra tekrar: %s", backoff, str(e)[:160])
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 60)
+        except Exception as e:  # noqa: BLE001 - keep the process alive
+            log.warning("Beklenmeyen polling hatası; %d sn sonra tekrar: %s", backoff, str(e)[:160])
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 60)
