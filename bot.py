@@ -302,24 +302,33 @@ def safe_send(chat_id, text, edit_message_id=None):
 # ---------------------------------------------------------------------------
 # Telegram handlers
 # ---------------------------------------------------------------------------
-def _menu_markup():
-    markup = types.InlineKeyboardMarkup(row_width=1)
-    markup.add(types.InlineKeyboardButton("🔥 Son 1 Gün", callback_data="1"))
-    markup.add(types.InlineKeyboardButton("🔥 Son 2 Gün", callback_data="2"))
-    markup.add(types.InlineKeyboardButton("🔥 Son 3 Gün", callback_data="3"))
-    markup.add(types.InlineKeyboardButton("📅 Son 1 Hafta", callback_data="7"))
-    markup.add(types.InlineKeyboardButton("📅 Son 2 Hafta", callback_data="14"))
-    markup.add(types.InlineKeyboardButton("📊 Geçtiğimiz Ay", callback_data="30"))
-    return markup
+# Period buttons (label -> days). Used by the persistent reply keyboard.
+PERIOD_BUTTONS = {
+    "🔥 Son 1 Gün": 1,
+    "🔥 Son 2 Gün": 2,
+    "🔥 Son 3 Gün": 3,
+    "📅 Son 1 Hafta": 7,
+    "📅 Son 2 Hafta": 14,
+    "📊 Geçtiğimiz Ay": 30,
+}
+
+
+def _reply_keyboard():
+    """A persistent custom keyboard that stays pinned at the bottom of the chat
+    (no need to type /start each time)."""
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True, is_persistent=True)
+    labels = list(PERIOD_BUTTONS.keys())
+    # two buttons per row
+    for i in range(0, len(labels), 2):
+        kb.row(*labels[i:i + 2])
+    return kb
 
 
 def show_menu(chat_id, title=None):
     if title is None:
-        title = "🎯 *The Assembly Stratejik Rapor Botu*\n\nHangi dönemi analiz etmek istersin?"
-    # Show the active AI provider/model so the running config is visible at a
-    # glance in Telegram (no log digging needed when debugging deploys).
+        title = "🎯 *The Assembly Stratejik Rapor Botu*\n\nAşağıdaki butonlardan bir dönem seç."
     title += f"\n\n🤖 _Aktif AI: {LLM_PROVIDER} · {LLM_MODEL}_"
-    bot.send_message(chat_id, title, reply_markup=_menu_markup(), parse_mode="Markdown")
+    bot.send_message(chat_id, title, reply_markup=_reply_keyboard(), parse_mode="Markdown")
 
 
 @bot.message_handler(commands=["start", "rapor"])
@@ -350,21 +359,13 @@ def _period_text(days):
     return "Geçtiğimiz Ay"
 
 
-@bot.callback_query_handler(func=lambda call: call.data.isdigit())
-def callback_handler(call):
-    # Stop the Telegram loading spinner immediately.
-    try:
-        bot.answer_callback_query(call.id)
-    except Exception:  # noqa: BLE001
-        pass
-
-    days = int(call.data)
+def run_report(chat_id, days):
+    """Fetch posts, analyze, and deliver the report. Shared by the persistent
+    reply keyboard and the (legacy) inline buttons. The reply keyboard stays
+    pinned at the bottom on its own, so no menu needs re-showing."""
     period_text = _period_text(days)
-    chat_id = call.message.chat.id
-
-    # Keep the menu (call.message) intact so the buttons stay clickable.
-    # Use a separate status message that we then turn into the report.
-    status = bot.send_message(chat_id, "🔄 Yapay zeka analiz yapıyor... (10-30 sn)")
+    status = bot.send_message(chat_id, f"🔄 *{period_text}* için yapay zeka analiz yapıyor... (10-30 sn)",
+                              parse_mode="Markdown")
     status_id = status.message_id
 
     posts, error = get_recent_posts(days)
@@ -375,7 +376,6 @@ def callback_handler(call):
             "Kaynak geçici olarak kapalı olabilir; lütfen birazdan tekrar deneyin.",
             chat_id, status_id,
         )
-        show_menu(chat_id, "🎯 Tekrar denemek için bir dönem seç:")
         return
 
     analysis = analyze_posts(posts, period_text)
@@ -388,8 +388,20 @@ def callback_handler(call):
     result = header + analysis + DISCLAIMER
     safe_send(chat_id, result, edit_message_id=status_id)
 
-    # Re-show the menu at the bottom so a new period is one tap away.
-    show_menu(chat_id, "🎯 Başka bir dönem seçebilirsin:")
+
+@bot.message_handler(func=lambda m: m.text in PERIOD_BUTTONS)
+def period_button_handler(message):
+    run_report(message.chat.id, PERIOD_BUTTONS[message.text])
+
+
+@bot.callback_query_handler(func=lambda call: call.data.isdigit())
+def callback_handler(call):
+    # Legacy inline buttons from older messages still work.
+    try:
+        bot.answer_callback_query(call.id)
+    except Exception:  # noqa: BLE001
+        pass
+    run_report(call.message.chat.id, int(call.data))
 
 
 class _HealthHandler(BaseHTTPRequestHandler):
@@ -445,6 +457,16 @@ if __name__ == "__main__":
         log.info("Webhook temizlendi; polling moduna geçiliyor.")
     except Exception as e:  # noqa: BLE001
         log.warning("Webhook temizlenemedi: %s", str(e)[:160])
+
+    # 3) Register slash commands so they show in Telegram's command menu.
+    try:
+        bot.set_my_commands([
+            types.BotCommand("start", "Menü ve butonları göster"),
+            types.BotCommand("rapor", "Menü ve butonları göster"),
+            types.BotCommand("diag", "Tanılama (ortam değişkenleri)"),
+        ])
+    except Exception as e:  # noqa: BLE001
+        log.warning("Komut menüsü ayarlanamadı: %s", str(e)[:160])
 
     log.info("🚀 The Assembly Grok AI Botu BAŞLATILDI (%d RSS kaynağı yapılandırıldı)", len(RSS_URLS))
     # skip_pending: ignore the backlog accrued while the bot was offline.
