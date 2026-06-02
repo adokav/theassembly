@@ -75,25 +75,30 @@ RSS_URLS = [u for u in ([_primary_rss] + _fallback_rss) if u]
 # Adding a new account is then just one line in _ACCOUNT_DEFS below.
 RSS_TEMPLATE = (os.getenv("RSS_TEMPLATE") or "").strip() or None
 
-# (key, görünen ad, X handle, o hesaba özel feed URL'sini tutan env değişkeni)
+# (key, görünen ad, X handle, o hesaba özel env değişkeni, varsayılan feed URL)
+# Env değişkeni varsa o öncelikli; yoksa varsayılan kullanılır. rss.app feed'leri
+# gizli anahtar değildir (URL'yi bilen okur), bu yüzden burada tutulabilir.
 _ACCOUNT_DEFS = [
-    ("assembly", "The Assembly", "InTheAssembly", "RSS_URL"),
-    ("bora", "Bora Özkent", "BoraOzkent", "BORA_RSS_URL"),
+    ("assembly", "The Assembly", "InTheAssembly", "RSS_URL", ""),
+    ("bora", "Bora Özkent", "BoraOzkent", "BORA_RSS_URL",
+     "https://rss.app/feeds/XVMR34JsDkbWXBYl.xml"),
 ]
 
 
-def _build_feeds(handle, env_key):
+def _build_feeds(handle, env_key, default=""):
     urls = []
     raw = os.getenv(env_key, "") if env_key else ""
     urls += [u.strip() for u in raw.split(",") if u.strip()]
     if RSS_TEMPLATE:
         urls.append(RSS_TEMPLATE.format(handle=handle))
+    if default:
+        urls.append(default)
     return list(dict.fromkeys(urls))  # de-dupe, keep order
 
 
 ACCOUNTS = {}
-for _key, _name, _handle, _env in _ACCOUNT_DEFS:
-    _feeds = _build_feeds(_handle, _env)
+for _key, _name, _handle, _env, _default in _ACCOUNT_DEFS:
+    _feeds = _build_feeds(_handle, _env, _default)
     if _key == "assembly":  # honor existing RSS_URL + RSS_FALLBACK_URLS too
         _feeds = list(dict.fromkeys(RSS_URLS + _feeds))
     ACCOUNTS[_key] = {"name": _name, "handle": _handle, "feeds": _feeds}
