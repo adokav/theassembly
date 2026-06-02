@@ -69,6 +69,35 @@ _primary_rss = os.getenv("RSS_URL", "").strip()
 _fallback_rss = [u.strip() for u in os.getenv("RSS_FALLBACK_URLS", "").split(",") if u.strip()]
 RSS_URLS = [u for u in ([_primary_rss] + _fallback_rss) if u]
 
+# --- Tracked accounts (multi-account) ---------------------------------------
+# RSS_TEMPLATE lets us build a feed URL from an X handle, e.g.
+#   "https://nitter.example/{handle}/rss"  or  ".../twitter/user/{handle}"
+# Adding a new account is then just one line in _ACCOUNT_DEFS below.
+RSS_TEMPLATE = (os.getenv("RSS_TEMPLATE") or "").strip() or None
+
+# (key, görünen ad, X handle, o hesaba özel feed URL'sini tutan env değişkeni)
+_ACCOUNT_DEFS = [
+    ("assembly", "The Assembly", "InTheAssembly", "RSS_URL"),
+    ("bora", "Bora Özkent", "BoraOzkent", "BORA_RSS_URL"),
+]
+
+
+def _build_feeds(handle, env_key):
+    urls = []
+    raw = os.getenv(env_key, "") if env_key else ""
+    urls += [u.strip() for u in raw.split(",") if u.strip()]
+    if RSS_TEMPLATE:
+        urls.append(RSS_TEMPLATE.format(handle=handle))
+    return list(dict.fromkeys(urls))  # de-dupe, keep order
+
+
+ACCOUNTS = {}
+for _key, _name, _handle, _env in _ACCOUNT_DEFS:
+    _feeds = _build_feeds(_handle, _env)
+    if _key == "assembly":  # honor existing RSS_URL + RSS_FALLBACK_URLS too
+        _feeds = list(dict.fromkeys(RSS_URLS + _feeds))
+    ACCOUNTS[_key] = {"name": _name, "handle": _handle, "feeds": _feeds}
+
 # Maximum Telegram message length is 4096; leave headroom for headers/markup.
 TELEGRAM_LIMIT = 3900
 # Turkey is permanently UTC+3 (no DST since 2016); used to show post times in TSİ.
@@ -148,10 +177,10 @@ def _fetch_feed(url):
     return None
 
 
-def fetch_any_feed():
-    """Try each configured RSS source (primary then fallbacks) until one yields
-    a usable feed. Returns (parsed_feed, used_url) or (None, None)."""
-    for url in RSS_URLS:
+def fetch_any_feed(feeds):
+    """Try each feed URL (primary then fallbacks) until one yields a usable feed.
+    Returns (parsed_feed, used_url) or (None, None)."""
+    for url in feeds:
         log.info("RSS çekiliyor: %s", url)
         parsed = _fetch_feed(url)
         if parsed and parsed.entries:
@@ -170,9 +199,11 @@ def _entry_text(entry):
     return body.strip()[:1500]
 
 
-def get_recent_posts(days):
+def get_recent_posts(days, feeds):
     """Return (posts, error). error is a user-facing string when fetch fails."""
-    parsed, used_url = fetch_any_feed()
+    if not feeds:
+        return [], "feed_unreachable"
+    parsed, used_url = fetch_any_feed(feeds)
     if parsed is None:
         return [], "feed_unreachable"
 
@@ -331,13 +362,13 @@ def enrich_recommendations(recs):
     return recs
 
 
-def build_report_with_market(recs, period_text):
+def build_report_with_market(recs, period_text, account_name):
     """Pass 2: turn enriched structured data into a graded, Turkish report."""
     payload = json.dumps({"period": period_text, "recommendations": recs}, ensure_ascii=False)
     system = ("Sen profesyonel bir trading stratejistisin. Türkçe, net yazarsın. "
               "Sana verilen yapılandırılmış veriyi ve GÜNCEL piyasa fiyatlarını kullan; "
               "fiyat veya tarih UYDURMA. market alanı null ise fiyat yorumu yapma.")
-    user = f"""Aşağıda The Assembly hesabının {period_text} içindeki tavsiyeleri ve her biri
+    user = f"""Aşağıda {account_name} hesabının {period_text} içindeki tavsiyeleri ve her biri
 için güncel piyasa verisi (JSON) var:
 
 {payload}
@@ -361,7 +392,7 @@ Sonda: **📌 Genel Görünüm** (2-3 cümle)."""
     )
 
 
-def _analyze_legacy(posts, period_text):
+def _analyze_legacy(posts, period_text, account_name):
     """Single-pass, text-only report. Fallback when structured extraction fails."""
     text = "\n\n".join(
         f"[{i+1}] Tarih: {p['date']}\nBaşlık: {p['title']}\nİçerik: {p['text']}\nLink: {p['link']}"
@@ -374,7 +405,7 @@ def _analyze_legacy(posts, period_text):
         "varlıkları kullan. Paylaşımlarda olmayan bir varlık, fiyat, seviye ya da TARİH "
         "UYDURMA. Her öneri için, o önerinin geçtiği paylaşımın TARİH ve SAATİNİ aynen kullan."
     )
-    user = f"""The Assembly hesabının **{period_text}** içindeki paylaşımlarını analiz et.
+    user = f"""{account_name} hesabının **{period_text}** içindeki paylaşımlarını analiz et.
 
 {text}
 
@@ -387,15 +418,15 @@ Somut sinyal yoksa "Bu dönemde belirgin bir yatırım sinyali tespit edilmedi" 
     )
 
 
-def analyze_posts(posts, period_text):
+def analyze_posts(posts, period_text, account_name="The Assembly"):
     if not posts:
         return "Bu dönemde analiz edilecek paylaşım bulunamadı."
     try:
         recs = extract_recommendations(posts)
         if recs:
             enrich_recommendations(recs)
-            return build_report_with_market(recs, period_text)
-        return _analyze_legacy(posts, period_text)
+            return build_report_with_market(recs, period_text, account_name)
+        return _analyze_legacy(posts, period_text, account_name)
     except Exception as e:  # noqa: BLE001
         log.exception("LLM analiz hatası (%s/%s)", LLM_PROVIDER, LLM_MODEL)
         msg = str(e)
@@ -463,27 +494,46 @@ PERIOD_BUTTONS = {
 }
 
 
-def _reply_keyboard():
-    """A persistent custom keyboard that stays pinned at the bottom of the chat
-    (no need to type /start each time)."""
+# Persistent keyboard buttons -> account key. One button per tracked account.
+ACCOUNT_BUTTONS = {f"📈 {a['name']}": key for key, a in ACCOUNTS.items()}
+
+
+def _account_keyboard():
+    """Persistent keyboard listing tracked accounts (pinned at the bottom)."""
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True, is_persistent=True)
-    labels = list(PERIOD_BUTTONS.keys())
-    # two buttons per row
-    for i in range(0, len(labels), 2):
-        kb.row(*labels[i:i + 2])
+    for label in ACCOUNT_BUTTONS:
+        kb.row(label)
+    return kb
+
+
+def _period_inline(account_key):
+    """Inline period buttons; callback_data carries account + days."""
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    kb.add(*[types.InlineKeyboardButton(lbl, callback_data=f"{account_key}:{days}")
+             for lbl, days in PERIOD_BUTTONS.items()])
     return kb
 
 
 def show_menu(chat_id, title=None):
     if title is None:
-        title = "🎯 *The Assembly Stratejik Rapor Botu*\n\nAşağıdaki butonlardan bir dönem seç."
+        title = "🎯 *Stratejik Rapor Botu*\n\nTakip edilen bir hesap seç:"
     title += f"\n\n🤖 _Aktif AI: {LLM_PROVIDER} · {LLM_MODEL}_"
-    bot.send_message(chat_id, title, reply_markup=_reply_keyboard(), parse_mode="Markdown")
+    bot.send_message(chat_id, title, reply_markup=_account_keyboard(), parse_mode="Markdown")
 
 
 @bot.message_handler(commands=["start", "rapor"])
 def send_menu(message):
     show_menu(message.chat.id)
+
+
+@bot.message_handler(func=lambda m: m.text in ACCOUNT_BUTTONS)
+def account_button_handler(message):
+    key = ACCOUNT_BUTTONS[message.text]
+    bot.send_message(
+        message.chat.id,
+        f"📊 *{ACCOUNTS[key]['name']}* — hangi dönemi raporlayalım?",
+        reply_markup=_period_inline(key), parse_mode="Markdown",
+    )
 
 
 @bot.message_handler(commands=["diag"])
@@ -509,27 +559,29 @@ def _period_text(days):
     return "Geçtiğimiz Ay"
 
 
-def run_report(chat_id, days):
-    """Fetch posts, analyze, and deliver the report. Shared by the persistent
-    reply keyboard and the (legacy) inline buttons. The reply keyboard stays
-    pinned at the bottom on its own, so no menu needs re-showing."""
+def run_report(chat_id, account_key, days):
+    """Fetch a tracked account's posts, analyze, and deliver the graded report."""
+    account = ACCOUNTS.get(account_key) or ACCOUNTS.get("assembly")
+    name = account["name"]
     period_text = _period_text(days)
-    status = bot.send_message(chat_id, f"🔄 *{period_text}* için yapay zeka analiz yapıyor... (10-30 sn)",
-                              parse_mode="Markdown")
+    status = bot.send_message(
+        chat_id, f"🔄 *{name}* · {period_text} analiz ediliyor... (10-40 sn)",
+        parse_mode="Markdown",
+    )
     status_id = status.message_id
 
-    posts, error = get_recent_posts(days)
+    posts, error = get_recent_posts(days, account["feeds"])
 
     if error == "feed_unreachable":
         bot.edit_message_text(
-            "⚠️ Paylaşım kaynağına (RSS) şu anda ulaşılamıyor. "
-            "Kaynak geçici olarak kapalı olabilir; lütfen birazdan tekrar deneyin.",
-            chat_id, status_id,
+            f"⚠️ *{name}* için paylaşım kaynağına (RSS) ulaşılamıyor. "
+            "Bu hesabın RSS adresi tanımlı olmayabilir ya da kaynak geçici kapalıdır.",
+            chat_id, status_id, parse_mode="Markdown",
         )
         return
 
-    analysis = analyze_posts(posts, period_text)
-    header = f"📊 *The Assembly — {period_text} Stratejik Rapor*\n"
+    analysis = analyze_posts(posts, period_text, name)
+    header = f"📊 *{name} — {period_text} Stratejik Rapor*\n"
     if posts:
         header += f"_({len(posts)} paylaşım analiz edildi)_\n\n"
     else:
@@ -539,19 +591,19 @@ def run_report(chat_id, days):
     safe_send(chat_id, result, edit_message_id=status_id)
 
 
-@bot.message_handler(func=lambda m: m.text in PERIOD_BUTTONS)
-def period_button_handler(message):
-    run_report(message.chat.id, PERIOD_BUTTONS[message.text])
-
-
-@bot.callback_query_handler(func=lambda call: call.data.isdigit())
+@bot.callback_query_handler(func=lambda call: True)
 def callback_handler(call):
-    # Legacy inline buttons from older messages still work.
     try:
         bot.answer_callback_query(call.id)
     except Exception:  # noqa: BLE001
         pass
-    run_report(call.message.chat.id, int(call.data))
+    data = call.data or ""
+    if ":" in data:
+        key, _, d = data.partition(":")
+        days = int(d) if d.isdigit() else 1
+    else:  # legacy inline buttons (bare day count) -> default account
+        key, days = "assembly", (int(data) if data.isdigit() else 1)
+    run_report(call.message.chat.id, key, days)
 
 
 class _HealthHandler(BaseHTTPRequestHandler):

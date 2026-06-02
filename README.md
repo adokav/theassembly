@@ -4,6 +4,8 @@
 analiz eden ve Telegram üzerinden **hisse / yatırım stratejisi raporu** üreten bot.
 
 ## Özellikler
+- **Çoklu hesap takibi:** alttaki kalıcı klavyeden hesap seç (The Assembly,
+  Bora Özkent…), ardından dönem seç. Yeni hesap eklemek `_ACCOUNT_DEFS`'e tek satır.
 - Buton menüsünden dönem seçimi (Son 1/2/3 gün, 1/2 hafta, son ay)
 - Yapay zeka ile paylaşımlara **dayalı** (uydurma yapmayan) stratejik analiz
 - **Yapılandırılmış çıkarım + canlı piyasa verisi:** her tavsiye için sembol, tarih,
