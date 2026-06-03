@@ -28,6 +28,9 @@ logging.basicConfig(
 )
 log = logging.getLogger("assembly-bot")
 
+# Bump when shipping notable changes so /diag confirms which build is live.
+BUILD_TAG = "2026-06-03 multi-account+market"
+
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 
 # --- LLM provider (OpenAI-compatible) ---------------------------------------
@@ -379,19 +382,33 @@ için güncel piyasa verisi (JSON) var:
 
 {payload}
 
-Her tavsiye için tam olarak şu formatta yaz:
+Telegram'da okunacak, MOBİL DOSTU, taranabilir bir rapor yaz. Kısa satırlar, net,
+abartısız. TAM olarak şu yapıda:
 
-**<asset> ({{ticker}})**
-• 🗓 Tavsiye: <date> — <action>
-• 🧭 Gerekçe: <thesis>
-• 💰 O günden bugüne: giriş ~<entry_then> → güncel <current> (<pct_change>%); 50G ort: <ma50>; 52H: <low52>–<high52>
-• 🚦 *BUGÜN ALINIR MI?*: 🟢 Hâlâ geçerli / 🟡 Kısmen / 🔴 Geç kalındı–Geçersiz — <gerekçe: güncel fiyat girişe ve 50G ortalamaya göre nerede, tez bozuldu mu, önerilen yeni giriş/stop>
+⚡ *ÖZET*
+<2 cümle: dönemin genel tonu + bugün en cazip fırsat hangisi>
 
-Karar mantığı: fiyat girişe yakın/altında ve tez sağlamsa 🟢; bir miktar kaçmış ama makulse 🟡;
-hedefi çoktan aşmış, 52H zirveye yapışmış ya da tez geçersizse 🔴.
-market null ise: "Fiyat verisi alınamadı, güncel değerlendirme yapılamadı" yaz.
+📋 *Tablo*
+Her tavsiye için tek satır (alınabilirliğe göre sırala: önce 🟢, sonra 🟡, en sonda 🔴):
+🟢/🟡/🔴 <ticker> — <pct_change>% (tavsiyeden bugüne)
 
-Sonda: **📌 Genel Görünüm** (2-3 cümle)."""
+———
+Sonra her tavsiye için bir KART (yine 🟢→🟡→🔴 sırasıyla):
+
+*<emoji> <ticker> · <asset>*
+💬 _Tez:_ <thesis tek cümle>
+📅 _Tavsiye:_ <date> — <action>
+📈 _Fiyat:_ ~<entry_then> → *<current>* (<pct_change>%) · 50G <ma50> · 52H <low52>–<high52>
+🎯 _Plan:_ <somut aksiyon: önerilen giriş bölgesi ve stop; ya da "bekle">
+🚦 _Karar:_ <🟢 Hâlâ alınır / 🟡 Geri çekilmede / 🔴 Geç kalındı> — <tek cümle gerekçe>
+
+Karar mantığı: fiyat girişe yakın/altında ve tez sağlamsa 🟢; bir miktar kaçmış ama
+makulse 🟡; hedefi çoktan aşmış, 52H zirveye yapışmış ya da tez bozulmuşsa 🔴.
+market alanı null ise o kart için sadece: "ℹ️ Fiyat verisi alınamadı" yaz, karar verme.
+
+———
+✅ *BUGÜN NE YAPMALI*
+<sadece aksiyon: 1-3 madde, ör. "• NVDA: 950 altı topla" / "• TSLA: bekle">"""
     return _llm_chat(
         [{"role": "system", "content": system}, {"role": "user", "content": user}],
         max_tokens=1900, temperature=0.4,
@@ -554,6 +571,10 @@ def send_diag(message):
         lines.append(f"`{k}`: {('✅ ' + v) if v else '❌ YOK'}")
     lines.append("")
     lines.append(f"🤖 Aktif sağlayıcı: *{LLM_PROVIDER}* · `{LLM_MODEL}`")
+    lines.append("")
+    lines.append(f"👥 *Takip edilen hesaplar ({len(ACCOUNTS)})* — build: {BUILD_TAG}")
+    for key, a in ACCOUNTS.items():
+        lines.append(f"• {a['name']} — {len(a['feeds'])} feed")
     bot.send_message(message.chat.id, "\n".join(lines), parse_mode="Markdown")
 
 
