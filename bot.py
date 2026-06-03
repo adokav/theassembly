@@ -29,7 +29,7 @@ logging.basicConfig(
 log = logging.getLogger("assembly-bot")
 
 # Bump when shipping notable changes so /diag confirms which build is live.
-BUILD_TAG = "2026-06-03 multi-account+market"
+BUILD_TAG = "2026-06-03 enriched+selfcheck+rr"
 
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 
@@ -301,9 +301,53 @@ Yalnızca JSON döndür."""
     return recs if isinstance(recs, list) else []
 
 
+def _sma(values, n):
+    if not values:
+        return None
+    window = values[-n:]
+    return sum(window) / len(window)
+
+
+def _rsi(closes, period=14):
+    """Wilder-style RSI from a close series. None if not enough data."""
+    if len(closes) < period + 1:
+        return None
+    gains, losses = [], []
+    for i in range(1, len(closes)):
+        d = closes[i] - closes[i - 1]
+        gains.append(max(d, 0.0))
+        losses.append(max(-d, 0.0))
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+    for i in range(period, len(gains)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return 100.0 - (100.0 / (1.0 + rs))
+
+
+def _atr(highs, lows, closes, period=14):
+    """Average True Range (volatility) — used for data-driven stop suggestions."""
+    n = min(len(highs), len(lows), len(closes))
+    if n < period + 1:
+        return None
+    trs = []
+    for i in range(1, n):
+        tr = max(
+            highs[i] - lows[i],
+            abs(highs[i] - closes[i - 1]),
+            abs(lows[i] - closes[i - 1]),
+        )
+        trs.append(tr)
+    return sum(trs[-period:]) / period
+
+
 def fetch_quote(ticker):
-    """Live market data from Yahoo Finance chart JSON (no heavy deps).
-    Returns dict with current price, 50d MA, 52w hi/lo and (ts, close) pairs."""
+    """Live market data + technicals from Yahoo Finance chart JSON (no heavy deps).
+    Returns current price, 50/200d MA, 52w hi/lo, RSI, ATR, volume trend and the
+    (ts, close) pairs used for the since-the-call comparison."""
     try:
         url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
         resp = requests.get(
@@ -314,16 +358,40 @@ def fetch_quote(ticker):
         res = resp.json()["chart"]["result"][0]
         meta = res.get("meta", {}) or {}
         ts = res.get("timestamp", []) or []
-        closes = (res.get("indicators", {}).get("quote", [{}])[0].get("close", []) or [])
-        pairs = [(t, c) for t, c in zip(ts, closes) if c is not None]
-        if not pairs:
+        q = (res.get("indicators", {}).get("quote", [{}]) or [{}])[0]
+        closes_raw = q.get("close", []) or []
+        highs_raw = q.get("high", []) or []
+        lows_raw = q.get("low", []) or []
+        vols_raw = q.get("volume", []) or []
+        # Keep only rows with a valid close, aligning the other series.
+        rows = [
+            (t, c, h, l, v)
+            for t, c, h, l, v in zip(ts, closes_raw, highs_raw, lows_raw, vols_raw)
+            if c is not None
+        ]
+        if not rows:
             return None
-        closes_only = [c for _, c in pairs]
-        current = meta.get("regularMarketPrice") or closes_only[-1]
-        ma50 = sum(closes_only[-50:]) / min(len(closes_only), 50)
+        pairs = [(t, c) for t, c, *_ in rows]
+        closes = [c for _, c, *_ in rows]
+        highs = [h if h is not None else c for _, c, h, l, v in rows]
+        lows = [l if l is not None else c for _, c, h, l, v in rows]
+        vols = [v for *_, v in rows if v is not None]
+
+        current = meta.get("regularMarketPrice") or closes[-1]
+        vol_trend = None
+        if len(vols) >= 30:
+            recent = sum(vols[-10:]) / 10
+            base = sum(vols[-40:-10]) / 30
+            if base > 0:
+                vol_trend = "artıyor" if recent > base * 1.15 else (
+                    "azalıyor" if recent < base * 0.85 else "yatay")
         return {
-            "current": current, "ma50": ma50,
-            "high52": max(closes_only), "low52": min(closes_only),
+            "current": current,
+            "ma50": _sma(closes, 50),
+            "ma200": _sma(closes, 200),
+            "high52": max(closes), "low52": min(closes),
+            "rsi": _rsi(closes), "atr": _atr(highs, lows, closes),
+            "vol_trend": vol_trend,
             "currency": meta.get("currency", ""), "pairs": pairs,
         }
     except Exception as e:  # noqa: BLE001
@@ -345,8 +413,17 @@ def _price_on_or_before(pairs, date_str):
     return chosen
 
 
+def _pct_since(pairs, current, date_str):
+    entry = _price_on_or_before(pairs, date_str)
+    if entry and entry > 0:
+        return ((current - entry) / entry) * 100
+    return None
+
+
 def enrich_recommendations(recs):
-    """Attach live market context to each recommendation that has a ticker."""
+    """Attach live market context + technicals to each recommendation, plus an
+    alpha (excess return vs the S&P 500) since the call date."""
+    bench = fetch_quote("SPY")  # benchmark fetched once and reused
     for r in recs[:10]:
         tk = (r.get("ticker") or "").strip().upper()
         if not tk:
@@ -356,17 +433,35 @@ def enrich_recommendations(recs):
         if not q:
             r["market"] = None
             continue
-        entry = _price_on_or_before(q["pairs"], r.get("date", "")) or r.get("entry_price")
+        date = r.get("date", "")
+        entry = _price_on_or_before(q["pairs"], date) or r.get("entry_price")
         cur = q["current"]
         chg = ((cur - entry) / entry * 100) if entry else None
+        # Alpha: stock return minus the index return over the same window.
+        alpha = None
+        bench_pct = None
+        if bench and chg is not None:
+            bench_pct = _pct_since(bench["pairs"], bench["current"], date)
+            if bench_pct is not None:
+                alpha = chg - bench_pct
+
+        def _r(x, d=2):
+            return round(x, d) if x is not None else None
+
         r["market"] = {
-            "current": round(cur, 2),
-            "entry_then": round(entry, 2) if entry else None,
-            "pct_change": round(chg, 1) if chg is not None else None,
-            "ma50": round(q["ma50"], 2),
-            "high52": round(q["high52"], 2),
-            "low52": round(q["low52"], 2),
-            "currency": q["currency"],
+            "current": _r(cur),
+            "entry_then": _r(entry) if entry else None,
+            "pct_change": _r(chg, 1),
+            "ma50": _r(q.get("ma50")),
+            "ma200": _r(q.get("ma200")),
+            "high52": _r(q.get("high52")),
+            "low52": _r(q.get("low52")),
+            "rsi": _r(q.get("rsi"), 0),
+            "atr": _r(q.get("atr")),
+            "vol_trend": q.get("vol_trend"),
+            "sp500_pct": _r(bench_pct, 1),
+            "alpha_vs_sp500": _r(alpha, 1),
+            "currency": q.get("currency"),
         }
     return recs
 
@@ -390,7 +485,7 @@ abartısız. TAM olarak şu yapıda:
 
 📋 *Tablo*
 Her tavsiye için tek satır (alınabilirliğe göre sırala: önce 🟢, sonra 🟡, en sonda 🔴):
-🟢/🟡/🔴 <ticker> — <pct_change>% (tavsiyeden bugüne)
+🟢/🟡/🔴 <ticker> — <pct_change>% (S&P'ye karşı <alpha_vs_sp500> puan)
 
 ———
 Sonra her tavsiye için bir KART (yine 🟢→🟡→🔴 sırasıyla):
@@ -398,21 +493,64 @@ Sonra her tavsiye için bir KART (yine 🟢→🟡→🔴 sırasıyla):
 *<emoji> <ticker> · <asset>*
 💬 _Tez:_ <thesis tek cümle>
 📅 _Tavsiye:_ <date> — <action>
-📈 _Fiyat:_ ~<entry_then> → *<current>* (<pct_change>%) · 50G <ma50> · 52H <low52>–<high52>
-🎯 _Plan:_ <somut aksiyon: önerilen giriş bölgesi ve stop; ya da "bekle">
+📈 _Fiyat:_ ~<entry_then> → *<current>* (<pct_change>%); S&P'ye karşı <alpha_vs_sp500> puan
+📊 _Teknik:_ RSI <rsi> · 50G <ma50> · 200G <ma200> · 52H <low52>–<high52> · hacim <vol_trend>
+🎯 _Plan:_ Giriş <bölge> · Stop <seviye> · Hedef <seviye> → ~<R>R   (ya da net "bekle")
 🚦 _Karar:_ <🟢 Hâlâ alınır / 🟡 Geri çekilmede / 🔴 Geç kalındı> — <tek cümle gerekçe>
 
-Karar mantığı: fiyat girişe yakın/altında ve tez sağlamsa 🟢; bir miktar kaçmış ama
-makulse 🟡; hedefi çoktan aşmış, 52H zirveye yapışmış ya da tez bozulmuşsa 🔴.
-market alanı null ise o kart için sadece: "ℹ️ Fiyat verisi alınamadı" yaz, karar verme.
+Kurallar:
+- Stop'u VERİYE dayandır: stop ≈ giriş − (1.5 × atr). Hedef ile giriş/stop'tan R-katsayısını (ödül/risk) hesapla.
+- RSI > 70 aşırı alım (🟢 verme, geri çekilme bekle); RSI < 35 + tez sağlam = fırsat.
+- Fiyat 200G ortalamanın altındaysa trend zayıf, dikkat et.
+- alpha_vs_sp500 negatifse "endeksin gerisinde" diye belirt; pozitifse güçlü.
+- Karar mantığı: fiyat girişe yakın/altında, RSI aşırı değil, tez sağlam ve trend yukarı ise 🟢;
+  bir miktar kaçmış ama makulse 🟡; hedefi aşmış, 52H zirveye yapışmış, RSI>75 ya da tez bozuksa 🔴.
+- Bir değer null ise o metriği yazma; market alanı null ise kartta sadece "ℹ️ Fiyat verisi alınamadı" yaz.
+- UYDURMA: yalnızca verilen sayıları kullan; R ve stop dışında yeni sayı türetme.
 
 ———
 ✅ *BUGÜN NE YAPMALI*
-<sadece aksiyon: 1-3 madde, ör. "• NVDA: 950 altı topla" / "• TSLA: bekle">"""
+<sadece aksiyon: 1-3 madde, ör. "• NVDA: 950 altı topla, stop 900" / "• TSLA: bekle">"""
     return _llm_chat(
         [{"role": "system", "content": system}, {"role": "user", "content": user}],
-        max_tokens=1900, temperature=0.4,
+        max_tokens=2200, temperature=0.4,
     )
+
+
+def verify_report(report, recs):
+    """Self-critique pass: cross-check every number in the report against the
+    structured market data, fix mismatches, drop invented figures. Returns the
+    corrected report, or the original if the check fails."""
+    facts = json.dumps(
+        [{"ticker": r.get("ticker"), "asset": r.get("asset"),
+          "date": r.get("date"), "market": r.get("market")} for r in recs],
+        ensure_ascii=False,
+    )
+    system = ("Sen titiz bir finansal düzeltmensin. Görevin: rapordaki HER sayı ve "
+              "tarihi verilen GERÇEK verilerle karşılaştırmak. Veride olmayan ya da "
+              "uyuşmayan her rakamı düzelt veya çıkar. Biçimi ve dili aynen koru. "
+              "Sadece düzeltilmiş raporu döndür, açıklama ekleme.")
+    user = f"""GERÇEK VERİ (doğru kabul et):
+{facts}
+
+DENETLENECEK RAPOR:
+{report}
+
+Kurallar:
+- Fiyat/yüzde/RSI/ortalama/52H/alpha gibi değerler GERÇEK VERİ ile birebir uyuşmalı.
+- Stop/Hedef/R hesapları mantıklı kalsın (giriş/atr'den türetilmiş); uydurma fiyat ekleme.
+- Veride olmayan bir varlık/sayı varsa çıkar.
+- Düzeltme gerekmiyorsa raporu aynen geri ver.
+Düzeltilmiş raporu döndür:"""
+    try:
+        out = _llm_chat(
+            [{"role": "system", "content": system}, {"role": "user", "content": user}],
+            max_tokens=2200, temperature=0.1,
+        )
+        return out.strip() if out and out.strip() else report
+    except Exception as e:  # noqa: BLE001
+        log.warning("Öz-denetim turu atlandı: %s", str(e)[:160])
+        return report
 
 
 def _analyze_legacy(posts, period_text, account_name):
@@ -448,7 +586,8 @@ def analyze_posts(posts, period_text, account_name="The Assembly"):
         recs = extract_recommendations(posts)
         if recs:
             enrich_recommendations(recs)
-            return build_report_with_market(recs, period_text, account_name)
+            report = build_report_with_market(recs, period_text, account_name)
+            return verify_report(report, recs)  # self-critique / anti-hallucination
         return _analyze_legacy(posts, period_text, account_name)
     except Exception as e:  # noqa: BLE001
         log.exception("LLM analiz hatası (%s/%s)", LLM_PROVIDER, LLM_MODEL)
