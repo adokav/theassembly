@@ -1,5 +1,7 @@
 import os
+import re
 import sys
+import json
 import time
 import logging
 import calendar
@@ -10,6 +12,7 @@ from datetime import datetime, timedelta
 import requests
 import feedparser
 import telebot
+from telebot.apihelper import ApiTelegramException
 from dotenv import load_dotenv
 from openai import OpenAI
 from telebot import types
@@ -24,6 +27,9 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
 log = logging.getLogger("assembly-bot")
+
+# Bump when shipping notable changes so /diag confirms which build is live.
+BUILD_TAG = "2026-06-03 multi-account+market"
 
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 
@@ -66,6 +72,40 @@ else:
 _primary_rss = os.getenv("RSS_URL", "").strip()
 _fallback_rss = [u.strip() for u in os.getenv("RSS_FALLBACK_URLS", "").split(",") if u.strip()]
 RSS_URLS = [u for u in ([_primary_rss] + _fallback_rss) if u]
+
+# --- Tracked accounts (multi-account) ---------------------------------------
+# RSS_TEMPLATE lets us build a feed URL from an X handle, e.g.
+#   "https://nitter.example/{handle}/rss"  or  ".../twitter/user/{handle}"
+# Adding a new account is then just one line in _ACCOUNT_DEFS below.
+RSS_TEMPLATE = (os.getenv("RSS_TEMPLATE") or "").strip() or None
+
+# (key, görünen ad, X handle, o hesaba özel env değişkeni, varsayılan feed URL)
+# Env değişkeni varsa o öncelikli; yoksa varsayılan kullanılır. rss.app feed'leri
+# gizli anahtar değildir (URL'yi bilen okur), bu yüzden burada tutulabilir.
+_ACCOUNT_DEFS = [
+    ("assembly", "The Assembly", "InTheAssembly", "RSS_URL", ""),
+    ("bora", "Bora Özkent", "BoraOzkent", "BORA_RSS_URL",
+     "https://rss.app/feeds/XVMR34JsDkbWXBYl.xml"),
+]
+
+
+def _build_feeds(handle, env_key, default=""):
+    urls = []
+    raw = os.getenv(env_key, "") if env_key else ""
+    urls += [u.strip() for u in raw.split(",") if u.strip()]
+    if RSS_TEMPLATE:
+        urls.append(RSS_TEMPLATE.format(handle=handle))
+    if default:
+        urls.append(default)
+    return list(dict.fromkeys(urls))  # de-dupe, keep order
+
+
+ACCOUNTS = {}
+for _key, _name, _handle, _env, _default in _ACCOUNT_DEFS:
+    _feeds = _build_feeds(_handle, _env, _default)
+    if _key == "assembly":  # honor existing RSS_URL + RSS_FALLBACK_URLS too
+        _feeds = list(dict.fromkeys(RSS_URLS + _feeds))
+    ACCOUNTS[_key] = {"name": _name, "handle": _handle, "feeds": _feeds}
 
 # Maximum Telegram message length is 4096; leave headroom for headers/markup.
 TELEGRAM_LIMIT = 3900
@@ -146,10 +186,10 @@ def _fetch_feed(url):
     return None
 
 
-def fetch_any_feed():
-    """Try each configured RSS source (primary then fallbacks) until one yields
-    a usable feed. Returns (parsed_feed, used_url) or (None, None)."""
-    for url in RSS_URLS:
+def fetch_any_feed(feeds):
+    """Try each feed URL (primary then fallbacks) until one yields a usable feed.
+    Returns (parsed_feed, used_url) or (None, None)."""
+    for url in feeds:
         log.info("RSS çekiliyor: %s", url)
         parsed = _fetch_feed(url)
         if parsed and parsed.entries:
@@ -168,9 +208,11 @@ def _entry_text(entry):
     return body.strip()[:1500]
 
 
-def get_recent_posts(days):
+def get_recent_posts(days, feeds):
     """Return (posts, error). error is a user-facing string when fetch fails."""
-    parsed, used_url = fetch_any_feed()
+    if not feeds:
+        return [], "feed_unreachable"
+    parsed, used_url = fetch_any_feed(feeds)
     if parsed is None:
         return [], "feed_unreachable"
 
@@ -194,63 +236,225 @@ def get_recent_posts(days):
 
 
 # ---------------------------------------------------------------------------
-# Analysis (Grok) — grounded to the actual posts
+# Analysis: structured extraction -> live market enrichment -> graded report
 # ---------------------------------------------------------------------------
-def analyze_posts(posts, period_text):
-    if not posts:
-        return "Bu dönemde analiz edilecek paylaşım bulunamadı."
+def _llm_chat(messages, max_tokens=1500, temperature=0.4, json_mode=False):
+    kwargs = dict(model=LLM_MODEL, messages=messages,
+                  temperature=temperature, max_tokens=max_tokens)
+    if json_mode:
+        try:
+            return client.chat.completions.create(
+                response_format={"type": "json_object"}, **kwargs
+            ).choices[0].message.content
+        except Exception:  # model may not support response_format; retry plain
+            pass
+    return client.chat.completions.create(**kwargs).choices[0].message.content
 
+
+def _parse_json(raw):
+    """Parse LLM output as JSON, tolerating surrounding prose/code fences."""
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except Exception:
+        pass
+    m = re.search(r"\{.*\}", raw, re.DOTALL)
+    if m:
+        try:
+            return json.loads(m.group(0))
+        except Exception:
+            return None
+    return None
+
+
+def extract_recommendations(posts):
+    """Pass 1: pull concrete, grounded recommendations as structured JSON."""
+    text = "\n\n".join(
+        f"[{i+1}] Tarih: {p['date']}\nBaşlık: {p['title']}\nİçerik: {p['text']}"
+        for i, p in enumerate(posts)
+    )
+    system = ("Sen bir finansal metin çıkarım motorusun. SADECE geçerli JSON döndür. "
+              "Paylaşımlarda olmayan hiçbir varlık, fiyat veya tarih uydurma.")
+    user = f"""Aşağıdaki paylaşımlardan SOMUT hisse/varlık tavsiyelerini çıkar.
+Sadece ABD/global borsalarda işlem gören hisseler için Yahoo Finance sembolü ver
+(ör. Apple -> AAPL, Nvidia -> NVDA). Net sembol çıkaramıyorsan o kaydı atla.
+
+JSON şeması:
+{{"recommendations": [
+  {{"asset": "şirket adı", "ticker": "AAPL", "action": "al|sat|izle",
+    "date": "GG.AA.YYYY", "entry_price": null, "target": null,
+    "conviction": "yüksek|orta|düşük", "thesis": "kısa gerekçe",
+    "source_quote": "ilgili alıntı"}}
+]}}
+
+Paylaşımlar:
+{text}
+
+Yalnızca JSON döndür."""
+    raw = _llm_chat(
+        [{"role": "system", "content": system}, {"role": "user", "content": user}],
+        max_tokens=1500, temperature=0.2, json_mode=True,
+    )
+    data = _parse_json(raw) or {}
+    recs = data.get("recommendations", [])
+    return recs if isinstance(recs, list) else []
+
+
+def fetch_quote(ticker):
+    """Live market data from Yahoo Finance chart JSON (no heavy deps).
+    Returns dict with current price, 50d MA, 52w hi/lo and (ts, close) pairs."""
+    try:
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
+        resp = requests.get(
+            url, params={"range": "1y", "interval": "1d"},
+            headers={"User-Agent": USER_AGENT}, timeout=HTTP_TIMEOUT,
+        )
+        resp.raise_for_status()
+        res = resp.json()["chart"]["result"][0]
+        meta = res.get("meta", {}) or {}
+        ts = res.get("timestamp", []) or []
+        closes = (res.get("indicators", {}).get("quote", [{}])[0].get("close", []) or [])
+        pairs = [(t, c) for t, c in zip(ts, closes) if c is not None]
+        if not pairs:
+            return None
+        closes_only = [c for _, c in pairs]
+        current = meta.get("regularMarketPrice") or closes_only[-1]
+        ma50 = sum(closes_only[-50:]) / min(len(closes_only), 50)
+        return {
+            "current": current, "ma50": ma50,
+            "high52": max(closes_only), "low52": min(closes_only),
+            "currency": meta.get("currency", ""), "pairs": pairs,
+        }
+    except Exception as e:  # noqa: BLE001
+        log.warning("Fiyat alınamadı (%s): %s", ticker, str(e)[:120])
+        return None
+
+
+def _price_on_or_before(pairs, date_str):
+    try:
+        target = datetime.strptime(date_str, "%d.%m.%Y").timestamp() + 86400
+    except Exception:
+        return None
+    chosen = None
+    for t, c in pairs:
+        if t <= target:
+            chosen = c
+        else:
+            break
+    return chosen
+
+
+def enrich_recommendations(recs):
+    """Attach live market context to each recommendation that has a ticker."""
+    for r in recs[:10]:
+        tk = (r.get("ticker") or "").strip().upper()
+        if not tk:
+            r["market"] = None
+            continue
+        q = fetch_quote(tk)
+        if not q:
+            r["market"] = None
+            continue
+        entry = _price_on_or_before(q["pairs"], r.get("date", "")) or r.get("entry_price")
+        cur = q["current"]
+        chg = ((cur - entry) / entry * 100) if entry else None
+        r["market"] = {
+            "current": round(cur, 2),
+            "entry_then": round(entry, 2) if entry else None,
+            "pct_change": round(chg, 1) if chg is not None else None,
+            "ma50": round(q["ma50"], 2),
+            "high52": round(q["high52"], 2),
+            "low52": round(q["low52"], 2),
+            "currency": q["currency"],
+        }
+    return recs
+
+
+def build_report_with_market(recs, period_text, account_name):
+    """Pass 2: turn enriched structured data into a graded, Turkish report."""
+    payload = json.dumps({"period": period_text, "recommendations": recs}, ensure_ascii=False)
+    system = ("Sen profesyonel bir trading stratejistisin. Türkçe, net yazarsın. "
+              "Sana verilen yapılandırılmış veriyi ve GÜNCEL piyasa fiyatlarını kullan; "
+              "fiyat veya tarih UYDURMA. market alanı null ise fiyat yorumu yapma.")
+    user = f"""Aşağıda {account_name} hesabının {period_text} içindeki tavsiyeleri ve her biri
+için güncel piyasa verisi (JSON) var:
+
+{payload}
+
+Telegram'da okunacak, MOBİL DOSTU, taranabilir bir rapor yaz. Kısa satırlar, net,
+abartısız. TAM olarak şu yapıda:
+
+⚡ *ÖZET*
+<2 cümle: dönemin genel tonu + bugün en cazip fırsat hangisi>
+
+📋 *Tablo*
+Her tavsiye için tek satır (alınabilirliğe göre sırala: önce 🟢, sonra 🟡, en sonda 🔴):
+🟢/🟡/🔴 <ticker> — <pct_change>% (tavsiyeden bugüne)
+
+———
+Sonra her tavsiye için bir KART (yine 🟢→🟡→🔴 sırasıyla):
+
+*<emoji> <ticker> · <asset>*
+💬 _Tez:_ <thesis tek cümle>
+📅 _Tavsiye:_ <date> — <action>
+📈 _Fiyat:_ ~<entry_then> → *<current>* (<pct_change>%) · 50G <ma50> · 52H <low52>–<high52>
+🎯 _Plan:_ <somut aksiyon: önerilen giriş bölgesi ve stop; ya da "bekle">
+🚦 _Karar:_ <🟢 Hâlâ alınır / 🟡 Geri çekilmede / 🔴 Geç kalındı> — <tek cümle gerekçe>
+
+Karar mantığı: fiyat girişe yakın/altında ve tez sağlamsa 🟢; bir miktar kaçmış ama
+makulse 🟡; hedefi çoktan aşmış, 52H zirveye yapışmış ya da tez bozulmuşsa 🔴.
+market alanı null ise o kart için sadece: "ℹ️ Fiyat verisi alınamadı" yaz, karar verme.
+
+———
+✅ *BUGÜN NE YAPMALI*
+<sadece aksiyon: 1-3 madde, ör. "• NVDA: 950 altı topla" / "• TSLA: bekle">"""
+    return _llm_chat(
+        [{"role": "system", "content": system}, {"role": "user", "content": user}],
+        max_tokens=1900, temperature=0.4,
+    )
+
+
+def _analyze_legacy(posts, period_text, account_name):
+    """Single-pass, text-only report. Fallback when structured extraction fails."""
     text = "\n\n".join(
         f"[{i+1}] Tarih: {p['date']}\nBaşlık: {p['title']}\nİçerik: {p['text']}\nLink: {p['link']}"
         for i, p in enumerate(posts)
     )
-
     system = (
         "Sen profesyonel bir makro analist ve trading stratejistisin. "
         "Türkçe, net ve aksiyon odaklı yazarsın. "
         "ÇOK ÖNEMLİ: Yalnızca sana verilen paylaşımlarda AÇIKÇA geçen hisse, kripto ve "
         "varlıkları kullan. Paylaşımlarda olmayan bir varlık, fiyat, seviye ya da TARİH "
-        "UYDURMA. Her öneri için, o önerinin geçtiği paylaşımın sana verilen TARİH ve "
-        "SAATİNİ ('Tarih: ...' satırından) aynen kullan. Bir paylaşımda net bir öneri "
-        "yoksa bunu açıkça belirt."
+        "UYDURMA. Her öneri için, o önerinin geçtiği paylaşımın TARİH ve SAATİNİ aynen kullan."
     )
-
-    user = f"""The Assembly hesabının **{period_text}** içindeki paylaşımlarını analiz et.
-
-Aşağıdaki {len(posts)} paylaşım gerçek veridir. Her paylaşımın başında o paylaşımın
-gerçek tarih ve saati (TSİ) yer alır:
+    user = f"""{account_name} hesabının **{period_text}** içindeki paylaşımlarını analiz et.
 
 {text}
 
-Raporu şu formatta yaz. Tespit ettiğin HER tavsiye/varlık için ayrı bir madde aç:
+Her tavsiye için: **Varlık** · 🗓 Tarih/Saat · 💡 Tavsiye · 🧭 Gerekçe · ⚠️ Risk.
+Sonda: **📌 Genel Stratejik Görünüm**.
+Somut sinyal yoksa "Bu dönemde belirgin bir yatırım sinyali tespit edilmedi" yaz."""
+    return _llm_chat(
+        [{"role": "system", "content": system}, {"role": "user", "content": user}],
+        max_tokens=1500, temperature=0.4,
+    )
 
-**1. <Varlık / Hisse adı>**
-   • 🗓 *Tarih/Saat:* <önerinin geçtiği paylaşımın tarih ve saati (TSİ)>
-   • 💡 *Tavsiye:* <al / sat / izle / kısa-uzun pozisyon vb. — paylaşımda ne dendiyse>
-   • 🧭 *Gerekçe:* <bu varlığın neden öne çıktığının paylaşıma dayalı açıklaması>
-   • ⚠️ *Zamanlama & Risk:* <kısa risk/zamanlama notu>
 
-Tüm maddelerden sonra:
-**📌 Genel Stratejik Görünüm:** <2-3 cümlelik özet>
-
-Paylaşımlarda somut bir yatırım sinyali yoksa "Bu dönemde belirgin bir yatırım sinyali tespit edilmedi" yaz."""
-
+def analyze_posts(posts, period_text, account_name="The Assembly"):
+    if not posts:
+        return "Bu dönemde analiz edilecek paylaşım bulunamadı."
     try:
-        response = client.chat.completions.create(
-            model=LLM_MODEL,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            temperature=0.4,
-            max_tokens=1500,
-        )
-        return response.choices[0].message.content
+        recs = extract_recommendations(posts)
+        if recs:
+            enrich_recommendations(recs)
+            return build_report_with_market(recs, period_text, account_name)
+        return _analyze_legacy(posts, period_text, account_name)
     except Exception as e:  # noqa: BLE001
         log.exception("LLM analiz hatası (%s/%s)", LLM_PROVIDER, LLM_MODEL)
         msg = str(e)
         low = msg.lower()
-        if "403" in msg or "credit" in low or "permission" in low or "quota" in low or "insufficient" in low:
+        if any(k in low for k in ("403", "credit", "permission", "quota", "insufficient")):
             return (
                 f"❌ Yapay zeka sağlayıcısı ({LLM_PROVIDER}) isteği reddetti: kredi/limit "
                 f"veya yetki sorunu görünüyor. Hesabınızda bakiye olduğundan ve API "
@@ -302,29 +506,57 @@ def safe_send(chat_id, text, edit_message_id=None):
 # ---------------------------------------------------------------------------
 # Telegram handlers
 # ---------------------------------------------------------------------------
-def _menu_markup():
-    markup = types.InlineKeyboardMarkup(row_width=1)
-    markup.add(types.InlineKeyboardButton("🔥 Son 1 Gün", callback_data="1"))
-    markup.add(types.InlineKeyboardButton("🔥 Son 2 Gün", callback_data="2"))
-    markup.add(types.InlineKeyboardButton("🔥 Son 3 Gün", callback_data="3"))
-    markup.add(types.InlineKeyboardButton("📅 Son 1 Hafta", callback_data="7"))
-    markup.add(types.InlineKeyboardButton("📅 Son 2 Hafta", callback_data="14"))
-    markup.add(types.InlineKeyboardButton("📊 Geçtiğimiz Ay", callback_data="30"))
-    return markup
+# Period buttons (label -> days). Used by the persistent reply keyboard.
+PERIOD_BUTTONS = {
+    "🔥 Son 1 Gün": 1,
+    "🔥 Son 2 Gün": 2,
+    "🔥 Son 3 Gün": 3,
+    "📅 Son 1 Hafta": 7,
+    "📅 Son 2 Hafta": 14,
+    "📊 Geçtiğimiz Ay": 30,
+}
+
+
+# Persistent keyboard buttons -> account key. One button per tracked account.
+ACCOUNT_BUTTONS = {f"📈 {a['name']}": key for key, a in ACCOUNTS.items()}
+
+
+def _account_keyboard():
+    """Persistent keyboard listing tracked accounts (pinned at the bottom)."""
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True, is_persistent=True)
+    for label in ACCOUNT_BUTTONS:
+        kb.row(label)
+    return kb
+
+
+def _period_inline(account_key):
+    """Inline period buttons; callback_data carries account + days."""
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    kb.add(*[types.InlineKeyboardButton(lbl, callback_data=f"{account_key}:{days}")
+             for lbl, days in PERIOD_BUTTONS.items()])
+    return kb
 
 
 def show_menu(chat_id, title=None):
     if title is None:
-        title = "🎯 *The Assembly Stratejik Rapor Botu*\n\nHangi dönemi analiz etmek istersin?"
-    # Show the active AI provider/model so the running config is visible at a
-    # glance in Telegram (no log digging needed when debugging deploys).
+        title = "🎯 *Stratejik Rapor Botu*\n\nTakip edilen bir hesap seç:"
     title += f"\n\n🤖 _Aktif AI: {LLM_PROVIDER} · {LLM_MODEL}_"
-    bot.send_message(chat_id, title, reply_markup=_menu_markup(), parse_mode="Markdown")
+    bot.send_message(chat_id, title, reply_markup=_account_keyboard(), parse_mode="Markdown")
 
 
 @bot.message_handler(commands=["start", "rapor"])
 def send_menu(message):
     show_menu(message.chat.id)
+
+
+@bot.message_handler(func=lambda m: m.text in ACCOUNT_BUTTONS)
+def account_button_handler(message):
+    key = ACCOUNT_BUTTONS[message.text]
+    bot.send_message(
+        message.chat.id,
+        f"📊 *{ACCOUNTS[key]['name']}* — hangi dönemi raporlayalım?",
+        reply_markup=_period_inline(key), parse_mode="Markdown",
+    )
 
 
 @bot.message_handler(commands=["diag"])
@@ -339,6 +571,10 @@ def send_diag(message):
         lines.append(f"`{k}`: {('✅ ' + v) if v else '❌ YOK'}")
     lines.append("")
     lines.append(f"🤖 Aktif sağlayıcı: *{LLM_PROVIDER}* · `{LLM_MODEL}`")
+    lines.append("")
+    lines.append(f"👥 *Takip edilen hesaplar ({len(ACCOUNTS)})* — build: {BUILD_TAG}")
+    for key, a in ACCOUNTS.items():
+        lines.append(f"• {a['name']} — {len(a['feeds'])} feed")
     bot.send_message(message.chat.id, "\n".join(lines), parse_mode="Markdown")
 
 
@@ -350,36 +586,29 @@ def _period_text(days):
     return "Geçtiğimiz Ay"
 
 
-@bot.callback_query_handler(func=lambda call: call.data.isdigit())
-def callback_handler(call):
-    # Stop the Telegram loading spinner immediately.
-    try:
-        bot.answer_callback_query(call.id)
-    except Exception:  # noqa: BLE001
-        pass
-
-    days = int(call.data)
+def run_report(chat_id, account_key, days):
+    """Fetch a tracked account's posts, analyze, and deliver the graded report."""
+    account = ACCOUNTS.get(account_key) or ACCOUNTS.get("assembly")
+    name = account["name"]
     period_text = _period_text(days)
-    chat_id = call.message.chat.id
-
-    # Keep the menu (call.message) intact so the buttons stay clickable.
-    # Use a separate status message that we then turn into the report.
-    status = bot.send_message(chat_id, "🔄 Yapay zeka analiz yapıyor... (10-30 sn)")
+    status = bot.send_message(
+        chat_id, f"🔄 *{name}* · {period_text} analiz ediliyor... (10-40 sn)",
+        parse_mode="Markdown",
+    )
     status_id = status.message_id
 
-    posts, error = get_recent_posts(days)
+    posts, error = get_recent_posts(days, account["feeds"])
 
     if error == "feed_unreachable":
         bot.edit_message_text(
-            "⚠️ Paylaşım kaynağına (RSS) şu anda ulaşılamıyor. "
-            "Kaynak geçici olarak kapalı olabilir; lütfen birazdan tekrar deneyin.",
-            chat_id, status_id,
+            f"⚠️ *{name}* için paylaşım kaynağına (RSS) ulaşılamıyor. "
+            "Bu hesabın RSS adresi tanımlı olmayabilir ya da kaynak geçici kapalıdır.",
+            chat_id, status_id, parse_mode="Markdown",
         )
-        show_menu(chat_id, "🎯 Tekrar denemek için bir dönem seç:")
         return
 
-    analysis = analyze_posts(posts, period_text)
-    header = f"📊 *The Assembly — {period_text} Stratejik Rapor*\n"
+    analysis = analyze_posts(posts, period_text, name)
+    header = f"📊 *{name} — {period_text} Stratejik Rapor*\n"
     if posts:
         header += f"_({len(posts)} paylaşım analiz edildi)_\n\n"
     else:
@@ -388,8 +617,20 @@ def callback_handler(call):
     result = header + analysis + DISCLAIMER
     safe_send(chat_id, result, edit_message_id=status_id)
 
-    # Re-show the menu at the bottom so a new period is one tap away.
-    show_menu(chat_id, "🎯 Başka bir dönem seçebilirsin:")
+
+@bot.callback_query_handler(func=lambda call: True)
+def callback_handler(call):
+    try:
+        bot.answer_callback_query(call.id)
+    except Exception:  # noqa: BLE001
+        pass
+    data = call.data or ""
+    if ":" in data:
+        key, _, d = data.partition(":")
+        days = int(d) if d.isdigit() else 1
+    else:  # legacy inline buttons (bare day count) -> default account
+        key, days = "assembly", (int(data) if data.isdigit() else 1)
+    run_report(call.message.chat.id, key, days)
 
 
 class _HealthHandler(BaseHTTPRequestHandler):
@@ -446,8 +687,41 @@ if __name__ == "__main__":
     except Exception as e:  # noqa: BLE001
         log.warning("Webhook temizlenemedi: %s", str(e)[:160])
 
-    log.info("🚀 The Assembly Grok AI Botu BAŞLATILDI (%d RSS kaynağı yapılandırıldı)", len(RSS_URLS))
-    # skip_pending: ignore the backlog accrued while the bot was offline.
-    # If a second instance runs the same token, Telegram returns 409 — that is
-    # now logged (above) instead of being invisible.
-    bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=30)
+    # 3) Register slash commands so they show in Telegram's command menu.
+    try:
+        bot.set_my_commands([
+            types.BotCommand("start", "Menü ve butonları göster"),
+            types.BotCommand("rapor", "Menü ve butonları göster"),
+            types.BotCommand("diag", "Tanılama (ortam değişkenleri)"),
+        ])
+    except Exception as e:  # noqa: BLE001
+        log.warning("Komut menüsü ayarlanamadı: %s", str(e)[:160])
+
+    log.info("🚀 Bot BAŞLATILDI (%d hesap takip ediliyor)", len(ACCOUNTS))
+
+    # Resilient polling loop. The most common failure is 409 Conflict: during a
+    # Render deploy the old instance is still polling while the new one starts,
+    # so two getUpdates calls briefly fight over the same token. Instead of
+    # crashing (and getting force-restarted), we wait and retry — once the old
+    # instance is gone the conflict clears and polling resumes on its own.
+    backoff = 5
+    while True:
+        try:
+            # skip_pending: drop the backlog accrued while the bot was offline.
+            bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=30)
+            backoff = 5  # clean return is rare; reset and loop again
+        except ApiTelegramException as e:
+            if getattr(e, "error_code", None) == 409:
+                log.warning(
+                    "409 Conflict: aynı token ile başka bir kopya dinliyor "
+                    "(genelde deploy sırasında eski kopya). %d sn beklenip denenecek.",
+                    backoff,
+                )
+            else:
+                log.warning("Telegram API hatası; %d sn sonra tekrar: %s", backoff, str(e)[:160])
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 60)
+        except Exception as e:  # noqa: BLE001 - keep the process alive
+            log.warning("Beklenmeyen polling hatası; %d sn sonra tekrar: %s", backoff, str(e)[:160])
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 60)
