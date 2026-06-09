@@ -6,6 +6,7 @@ import time
 import logging
 import calendar
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from datetime import datetime, timedelta
 
@@ -29,7 +30,7 @@ logging.basicConfig(
 log = logging.getLogger("assembly-bot")
 
 # Bump when shipping notable changes so /diag confirms which build is live.
-BUILD_TAG = "2026-06-03 webhook+cb"
+BUILD_TAG = "2026-06-03 fast"
 
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 
@@ -158,7 +159,9 @@ log.info("LLM sağlayıcı: %s | model: %s%s", LLM_PROVIDER, LLM_MODEL,
          f" | base_url: {LLM_BASE_URL}" if LLM_BASE_URL else "")
 
 bot = telebot.TeleBot(TOKEN)
-client = OpenAI(api_key=LLM_API_KEY, base_url=LLM_BASE_URL)
+# Bounded timeout + a single retry so a slow/hung LLM call fails fast and
+# visibly instead of leaving the user on an endless "analiz ediliyor".
+client = OpenAI(api_key=LLM_API_KEY, base_url=LLM_BASE_URL, timeout=40.0, max_retries=1)
 
 
 # ---------------------------------------------------------------------------
@@ -430,14 +433,28 @@ def _pct_since(pairs, current, date_str):
 
 def enrich_recommendations(recs):
     """Attach live market context + technicals to each recommendation, plus an
-    alpha (excess return vs the S&P 500) since the call date."""
-    bench = fetch_quote("SPY")  # benchmark fetched once and reused
-    for r in recs[:10]:
+    alpha (excess return vs the S&P 500) since the call date. All price fetches
+    run in parallel so the report stays fast even with several tickers."""
+    targets = recs[:10]
+    tickers = {(r.get("ticker") or "").strip().upper() for r in targets}
+    tickers.discard("")
+    tickers.add("SPY")  # benchmark
+    quotes = {}
+    if tickers:
+        with ThreadPoolExecutor(max_workers=min(8, len(tickers))) as ex:
+            futs = {ex.submit(fetch_quote, tk): tk for tk in tickers}
+            for fut in futs:
+                try:
+                    quotes[futs[fut]] = fut.result()
+                except Exception:  # noqa: BLE001
+                    quotes[futs[fut]] = None
+    bench = quotes.get("SPY")
+    for r in targets:
         tk = (r.get("ticker") or "").strip().upper()
         if not tk:
             r["market"] = None
             continue
-        q = fetch_quote(tk)
+        q = quotes.get(tk)
         if not q:
             r["market"] = None
             continue
