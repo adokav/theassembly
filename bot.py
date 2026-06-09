@@ -30,7 +30,7 @@ logging.basicConfig(
 log = logging.getLogger("assembly-bot")
 
 # Bump when shipping notable changes so /diag confirms which build is live.
-BUILD_TAG = "2026-06-03 fast"
+BUILD_TAG = "2026-06-03 progress"
 
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 
@@ -604,15 +604,27 @@ Somut sinyal yoksa "Bu dönemde belirgin bir yatırım sinyali tespit edilmedi" 
     )
 
 
-def analyze_posts(posts, period_text, account_name="The Assembly"):
+def analyze_posts(posts, period_text, account_name="The Assembly", notify=None):
+    def step(msg):
+        """Push a live progress line to the status message (best-effort)."""
+        if notify:
+            try:
+                notify(msg)
+            except Exception:  # noqa: BLE001
+                pass
     if not posts:
         return "Bu dönemde analiz edilecek paylaşım bulunamadı."
     try:
+        step(f"🧠 {len(posts)} paylaşım yapay zekayla ayıklanıyor...")
         recs = extract_recommendations(posts)
         if recs:
+            step(f"📈 {len(recs)} öneri için canlı fiyatlar alınıyor...")
             enrich_recommendations(recs)
+            step("📝 Stratejik rapor yazılıyor...")
             report = build_report_with_market(recs, period_text, account_name)
+            step("🔍 Rapor doğrulanıyor (son kontrol)...")
             return verify_report(report, recs)  # self-critique / anti-hallucination
+        step("📝 Rapor yazılıyor...")
         return _analyze_legacy(posts, period_text, account_name)
     except Exception as e:  # noqa: BLE001
         log.exception("LLM analiz hatası (%s/%s)", LLM_PROVIDER, LLM_MODEL)
@@ -797,7 +809,15 @@ def run_report(chat_id, account_key, days):
     )
     status_id = status.message_id
 
+    def notify(msg):
+        """Edit the status message so the user sees live progress / where it stalls."""
+        bot.edit_message_text(
+            f"🔄 *{name}* · {period_text}\n{msg}", chat_id, status_id,
+            parse_mode="Markdown",
+        )
+
     try:
+        notify("📥 Paylaşımlar kaynaktan (RSS) çekiliyor...")
         posts, error = get_recent_posts(days, account["feeds"])
 
         if error == "feed_unreachable":
@@ -808,7 +828,7 @@ def run_report(chat_id, account_key, days):
             )
             return
 
-        analysis = analyze_posts(posts, period_text, name)
+        analysis = analyze_posts(posts, period_text, name, notify=notify)
         header = f"📊 *{name} — {period_text} Stratejik Rapor*\n"
         if posts:
             header += f"_({len(posts)} paylaşım analiz edildi)_\n\n"
