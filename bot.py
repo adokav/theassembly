@@ -29,7 +29,7 @@ logging.basicConfig(
 log = logging.getLogger("assembly-bot")
 
 # Bump when shipping notable changes so /diag confirms which build is live.
-BUILD_TAG = "2026-06-03 webhook"
+BUILD_TAG = "2026-06-03 webhook+cb"
 
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 
@@ -773,35 +773,47 @@ def run_report(chat_id, account_key, days):
     account = ACCOUNTS.get(account_key) or ACCOUNTS.get("assembly")
     name = account["name"]
     period_text = _period_text(days)
+    log.info("Rapor isteği: %s · %s gün", name, days)
     status = bot.send_message(
         chat_id, f"🔄 *{name}* · {period_text} analiz ediliyor... (10-40 sn)",
         parse_mode="Markdown",
     )
     status_id = status.message_id
 
-    posts, error = get_recent_posts(days, account["feeds"])
+    try:
+        posts, error = get_recent_posts(days, account["feeds"])
 
-    if error == "feed_unreachable":
-        bot.edit_message_text(
-            f"⚠️ *{name}* için paylaşım kaynağına (RSS) ulaşılamıyor. "
-            "Bu hesabın RSS adresi tanımlı olmayabilir ya da kaynak geçici kapalıdır.",
-            chat_id, status_id, parse_mode="Markdown",
-        )
-        return
+        if error == "feed_unreachable":
+            bot.edit_message_text(
+                f"⚠️ *{name}* için paylaşım kaynağına (RSS) ulaşılamıyor. "
+                "Bu hesabın RSS adresi tanımlı olmayabilir ya da kaynak geçici kapalıdır.",
+                chat_id, status_id, parse_mode="Markdown",
+            )
+            return
 
-    analysis = analyze_posts(posts, period_text, name)
-    header = f"📊 *{name} — {period_text} Stratejik Rapor*\n"
-    if posts:
-        header += f"_({len(posts)} paylaşım analiz edildi)_\n\n"
-    else:
-        header += "\n"
+        analysis = analyze_posts(posts, period_text, name)
+        header = f"📊 *{name} — {period_text} Stratejik Rapor*\n"
+        if posts:
+            header += f"_({len(posts)} paylaşım analiz edildi)_\n\n"
+        else:
+            header += "\n"
 
-    result = header + analysis + DISCLAIMER
-    safe_send(chat_id, result, edit_message_id=status_id)
+        result = header + analysis + DISCLAIMER
+        safe_send(chat_id, result, edit_message_id=status_id)
+    except Exception as e:  # noqa: BLE001 - never fail silently
+        log.exception("run_report hatası (%s, %s gün)", name, days)
+        try:
+            bot.edit_message_text(
+                f"❌ Rapor üretilirken hata oluştu: {str(e)[:200]}",
+                chat_id, status_id,
+            )
+        except Exception:  # noqa: BLE001
+            bot.send_message(chat_id, f"❌ Rapor hatası: {str(e)[:200]}")
 
 
 @bot.callback_query_handler(func=lambda call: True)
 def callback_handler(call):
+    log.info("Callback alındı: %s", call.data)
     try:
         bot.answer_callback_query(call.id)
     except Exception:  # noqa: BLE001
@@ -863,7 +875,11 @@ def run_webhook(external_url, port):
     try:
         bot.remove_webhook()
         time.sleep(1)
-        bot.set_webhook(url=url, drop_pending_updates=True)
+        bot.set_webhook(
+            url=url,
+            allowed_updates=["message", "callback_query"],
+            drop_pending_updates=True,
+        )
         log.info("🚀 Bot WEBHOOK modunda BAŞLADI → %s (%d hesap)", url, len(ACCOUNTS))
     except Exception as e:  # noqa: BLE001
         log.error("Webhook ayarlanamadı: %s", str(e)[:200])
