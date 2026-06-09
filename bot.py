@@ -29,7 +29,7 @@ logging.basicConfig(
 log = logging.getLogger("assembly-bot")
 
 # Bump when shipping notable changes so /diag confirms which build is live.
-BUILD_TAG = "2026-06-03 rss-ua-fix"
+BUILD_TAG = "2026-06-03 feedtest"
 
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 
@@ -725,7 +725,42 @@ def send_diag(message):
     bot.send_message(message.chat.id, "\n".join(lines), parse_mode="Markdown")
 
 
-def _period_text(days):
+@bot.message_handler(commands=["feedtest"])
+def send_feedtest(message):
+    """Live-fetch every account's feed and report the raw HTTP result so we can
+    see *why* a feed fails (403 block, empty, parse error, ...) from Telegram."""
+    bot.send_message(message.chat.id, "🔬 Feed'ler test ediliyor...")
+    lines = ["🔬 *Feed Testi*", ""]
+    for key, a in ACCOUNTS.items():
+        lines.append(f"*{a['name']}*")
+        if not a["feeds"]:
+            lines.append("• ❌ Tanımlı feed yok")
+            lines.append("")
+            continue
+        for url in a["feeds"]:
+            short = url if len(url) < 48 else url[:45] + "…"
+            try:
+                resp = requests.get(
+                    url, timeout=HTTP_TIMEOUT,
+                    headers={
+                        "User-Agent": USER_AGENT,
+                        "Accept": "application/rss+xml, application/xml, text/xml, */*;q=0.8",
+                        "Accept-Language": "tr,en;q=0.8",
+                    },
+                )
+                ctype = resp.headers.get("Content-Type", "?").split(";")[0]
+                parsed = feedparser.parse(resp.content)
+                n = len(parsed.entries)
+                mark = "✅" if (resp.status_code == 200 and n > 0) else "⚠️"
+                lines.append(f"• {mark} HTTP {resp.status_code} · {ctype} · {len(resp.content)}B · {n} kayıt")
+                if resp.status_code != 200 or n == 0:
+                    snippet = resp.text[:120].replace("\n", " ").strip()
+                    lines.append(f"  ↳ `{snippet}`")
+            except Exception as e:  # noqa: BLE001
+                lines.append(f"• ❌ Hata: {str(e)[:100]}")
+            lines.append(f"  _{short}_")
+        lines.append("")
+    bot.send_message(message.chat.id, "\n".join(lines), parse_mode="Markdown")
     if days <= 3:
         return f"Son {days} Gün"
     if days <= 14:
@@ -840,6 +875,7 @@ if __name__ == "__main__":
             types.BotCommand("start", "Menü ve butonları göster"),
             types.BotCommand("rapor", "Menü ve butonları göster"),
             types.BotCommand("diag", "Tanılama (ortam değişkenleri)"),
+            types.BotCommand("feedtest", "RSS feed'lerini canlı test et"),
         ])
     except Exception as e:  # noqa: BLE001
         log.warning("Komut menüsü ayarlanamadı: %s", str(e)[:160])
