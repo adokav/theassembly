@@ -29,7 +29,7 @@ logging.basicConfig(
 log = logging.getLogger("assembly-bot")
 
 # Bump when shipping notable changes so /diag confirms which build is live.
-BUILD_TAG = "2026-06-03 feedtest"
+BUILD_TAG = "2026-06-03 webhook"
 
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 
@@ -815,42 +815,92 @@ def callback_handler(call):
     run_report(call.message.chat.id, key, days)
 
 
-class _HealthHandler(BaseHTTPRequestHandler):
+WEBHOOK_PATH = f"/webhook/{TOKEN}" if TOKEN else "/webhook"
+
+
+class _BotHTTPHandler(BaseHTTPRequestHandler):
+    """Serves the platform health check (GET) and, in webhook mode, receives
+    Telegram updates (POST). Each inbound POST also wakes a sleeping free-tier
+    Render service — which is exactly why webhooks beat polling here."""
+
     def do_GET(self):
         self.send_response(200)
         self.send_header("Content-Type", "text/plain")
         self.end_headers()
         self.wfile.write(b"ok")
 
+    def do_POST(self):
+        if self.path != WEBHOOK_PATH:
+            self.send_response(403)
+            self.end_headers()
+            return
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(length).decode("utf-8")
+        except Exception:  # noqa: BLE001
+            self.send_response(400)
+            self.end_headers()
+            return
+        # Acknowledge Telegram immediately, then dispatch to handlers (threaded).
+        self.send_response(200)
+        self.end_headers()
+        try:
+            update = telebot.types.Update.de_json(body)
+            bot.process_new_updates([update])
+        except Exception as e:  # noqa: BLE001
+            log.warning("Webhook update işlenemedi: %s", str(e)[:160])
+
     def log_message(self, *args):  # silence per-request logging
         pass
 
 
-def start_health_server():
-    """When PORT is set (e.g. Render Web Service), serve a tiny health endpoint
-    in a background thread so the platform's port/health check passes while the
-    bot polls. No-op for Background Workers (no PORT)."""
-    port = os.getenv("PORT")
-    if not port:
-        return
+def run_webhook(external_url, port):
+    """Webhook mode: Telegram POSTs each update to our public URL. Best fit for a
+    free Render Web Service, which sleeps without inbound HTTP — every message
+    now wakes it. No user configuration needed (RENDER_EXTERNAL_URL is built-in)."""
+    url = external_url.rstrip("/") + WEBHOOK_PATH
+    server = HTTPServer(("0.0.0.0", int(port)), _BotHTTPHandler)
     try:
-        server = HTTPServer(("0.0.0.0", int(port)), _HealthHandler)
+        bot.remove_webhook()
+        time.sleep(1)
+        bot.set_webhook(url=url, drop_pending_updates=True)
+        log.info("🚀 Bot WEBHOOK modunda BAŞLADI → %s (%d hesap)", url, len(ACCOUNTS))
     except Exception as e:  # noqa: BLE001
-        log.warning("Health sunucusu başlatılamadı (PORT=%s): %s", port, str(e)[:160])
-        return
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    log.info("Health sunucusu %s portunda dinliyor.", port)
+        log.error("Webhook ayarlanamadı: %s", str(e)[:200])
+        raise
+    server.serve_forever()
+
+
+def run_polling():
+    """Polling mode for local/dev (no public URL). Resilient to 409 Conflict."""
+    try:
+        bot.remove_webhook()
+        log.info("Webhook temizlendi; polling moduna geçiliyor.")
+    except Exception as e:  # noqa: BLE001
+        log.warning("Webhook temizlenemedi: %s", str(e)[:160])
+    log.info("🚀 Bot POLLING modunda BAŞLADI (%d hesap)", len(ACCOUNTS))
+    backoff = 5
+    while True:
+        try:
+            bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=30)
+            backoff = 5
+        except ApiTelegramException as e:
+            if getattr(e, "error_code", None) == 409:
+                log.warning("409 Conflict: başka bir kopya dinliyor; %d sn sonra tekrar.", backoff)
+            else:
+                log.warning("Telegram API hatası; %d sn sonra tekrar: %s", backoff, str(e)[:160])
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 60)
+        except Exception as e:  # noqa: BLE001 - keep the process alive
+            log.warning("Beklenmeyen polling hatası; %d sn sonra tekrar: %s", backoff, str(e)[:160])
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 60)
 
 
 if __name__ == "__main__":
-    # Surface polling/Telegram errors instead of silently swallowing them.
     telebot.logger.setLevel(logging.INFO)
 
-    # Keep the platform health check happy if deployed as a Web Service.
-    start_health_server()
-
-    # 1) Verify the token & network reach Telegram. Fails fast with a clear
-    #    message instead of a silent "no response" bot.
+    # 1) Verify the token & network reach Telegram. Fail fast with a clear message.
     try:
         me = bot.get_me()
         log.info("Telegram bağlantısı OK → @%s (id=%s)", me.username, me.id)
@@ -861,15 +911,7 @@ if __name__ == "__main__":
         )
         sys.exit(1)
 
-    # 2) Clear any leftover webhook — a set webhook makes getUpdates (polling)
-    #    return 409 and the bot silently receives no messages.
-    try:
-        bot.remove_webhook()
-        log.info("Webhook temizlendi; polling moduna geçiliyor.")
-    except Exception as e:  # noqa: BLE001
-        log.warning("Webhook temizlenemedi: %s", str(e)[:160])
-
-    # 3) Register slash commands so they show in Telegram's command menu.
+    # 2) Register slash commands so they show in Telegram's command menu.
     try:
         bot.set_my_commands([
             types.BotCommand("start", "Menü ve butonları göster"),
@@ -880,31 +922,10 @@ if __name__ == "__main__":
     except Exception as e:  # noqa: BLE001
         log.warning("Komut menüsü ayarlanamadı: %s", str(e)[:160])
 
-    log.info("🚀 Bot BAŞLATILDI (%d hesap takip ediliyor)", len(ACCOUNTS))
-
-    # Resilient polling loop. The most common failure is 409 Conflict: during a
-    # Render deploy the old instance is still polling while the new one starts,
-    # so two getUpdates calls briefly fight over the same token. Instead of
-    # crashing (and getting force-restarted), we wait and retry — once the old
-    # instance is gone the conflict clears and polling resumes on its own.
-    backoff = 5
-    while True:
-        try:
-            # skip_pending: drop the backlog accrued while the bot was offline.
-            bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=30)
-            backoff = 5  # clean return is rare; reset and loop again
-        except ApiTelegramException as e:
-            if getattr(e, "error_code", None) == 409:
-                log.warning(
-                    "409 Conflict: aynı token ile başka bir kopya dinliyor "
-                    "(genelde deploy sırasında eski kopya). %d sn beklenip denenecek.",
-                    backoff,
-                )
-            else:
-                log.warning("Telegram API hatası; %d sn sonra tekrar: %s", backoff, str(e)[:160])
-            time.sleep(backoff)
-            backoff = min(backoff * 2, 60)
-        except Exception as e:  # noqa: BLE001 - keep the process alive
-            log.warning("Beklenmeyen polling hatası; %d sn sonra tekrar: %s", backoff, str(e)[:160])
-            time.sleep(backoff)
-            backoff = min(backoff * 2, 60)
+    # 3) Webhook when a public URL is available (Render Web Service), else polling.
+    _external = (os.getenv("RENDER_EXTERNAL_URL") or os.getenv("WEBHOOK_URL") or "").strip()
+    _port = os.getenv("PORT")
+    if _external and _port:
+        run_webhook(_external, _port)
+    else:
+        run_polling()
