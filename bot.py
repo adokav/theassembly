@@ -30,7 +30,7 @@ logging.basicConfig(
 log = logging.getLogger("assembly-bot")
 
 # Bump when shipping notable changes so /diag confirms which build is live.
-BUILD_TAG = "2026-06-03 progress"
+BUILD_TAG = "2026-06-09 fix-period"
 
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 
@@ -790,6 +790,10 @@ def send_feedtest(message):
             lines.append(f"  _{short}_")
         lines.append("")
     bot.send_message(message.chat.id, "\n".join(lines), parse_mode="Markdown")
+
+
+def _period_text(days):
+    """Human-readable Turkish label for a look-back window (in days)."""
     if days <= 3:
         return f"Son {days} Gün"
     if days <= 14:
