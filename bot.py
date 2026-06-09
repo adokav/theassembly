@@ -29,7 +29,7 @@ logging.basicConfig(
 log = logging.getLogger("assembly-bot")
 
 # Bump when shipping notable changes so /diag confirms which build is live.
-BUILD_TAG = "2026-06-03 enriched+selfcheck+rr"
+BUILD_TAG = "2026-06-03 rss-ua-fix"
 
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 
@@ -113,8 +113,11 @@ TELEGRAM_LIMIT = 3900
 TR_OFFSET = timedelta(hours=3)
 HTTP_TIMEOUT = 20
 HTTP_RETRIES = 4
+# Use a realistic browser UA: services like rss.app block generic "bot" agents
+# (they return 403), which surfaced as "RSS'e ulaşılamıyor".
 USER_AGENT = (
-    "Mozilla/5.0 (compatible; AssemblyBot/1.0; +https://github.com/adokav/theassembly)"
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
 
 DISCLAIMER = (
@@ -170,7 +173,12 @@ def _fetch_feed(url):
             resp = requests.get(
                 url,
                 timeout=HTTP_TIMEOUT,
-                headers={"User-Agent": USER_AGENT, "Accept": "application/rss+xml, application/xml, text/xml"},
+                headers={
+                    "User-Agent": USER_AGENT,
+                    "Accept": "application/rss+xml, application/xml, text/xml, */*;q=0.8",
+                    "Accept-Language": "tr,en;q=0.8",
+                    "Cache-Control": "no-cache",
+                },
             )
             resp.raise_for_status()
             parsed = feedparser.parse(resp.content)
