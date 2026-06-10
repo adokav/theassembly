@@ -31,7 +31,7 @@ logging.basicConfig(
 log = logging.getLogger("assembly-bot")
 
 # Bump when shipping notable changes so /diag confirms which build is live.
-BUILD_TAG = "2026-06-10 sector-news"
+BUILD_TAG = "2026-06-10 sector-specific"
 
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 
@@ -319,7 +319,7 @@ JSON şeması:
 {{"recommendations": [
   {{"asset": "şirket adı", "ticker": "AAPL", "action": "al|sat|izle",
     "date": "GG.AA.YYYY", "entry_price": null, "target": null,
-    "conviction": "yüksek|orta|düşük", "sector": "şirketin sektörü (Türkçe, ör. Yarı iletken / Teknoloji / Enerji / Finans / Sağlık)",
+    "conviction": "yüksek|orta|düşük", "sector": "şirketin SPESİFİK alt sektörü/endüstrisi (Türkçe). Genel 'Teknoloji/Finans/Sağlık' YAZMA; mümkün olan en dar niş: ör. NVDA->'Yarı iletken (GPU)', MSFT->'Bulut & kurumsal yazılım', JPM->'Yatırım bankacılığı', XOM->'Petrol & gaz (entegre)', LLY->'Biyofarma/ilaç', TSLA->'Elektrikli araç üreticisi', V->'Ödeme sistemleri'",
     "thesis": "kısa gerekçe", "source_quote": "ilgili alıntı"}}
 ]}}
 
