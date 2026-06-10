@@ -9,6 +9,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from datetime import datetime, timedelta
+from urllib.parse import quote_plus
 
 import requests
 import feedparser
@@ -30,7 +31,7 @@ logging.basicConfig(
 log = logging.getLogger("assembly-bot")
 
 # Bump when shipping notable changes so /diag confirms which build is live.
-BUILD_TAG = "2026-06-10 combined"
+BUILD_TAG = "2026-06-10 sector-news"
 
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 
@@ -125,6 +126,10 @@ HTTP_RETRIES = 4
 # 12k TPM ceiling while leaving room for the report + verify passes.
 MAX_POST_CHARS = 700
 EXTRACT_CHAR_BUDGET = 14000
+# Per-stock news (best-effort, single quick attempt so it never blocks a report).
+NEWS_TIMEOUT = 10
+NEWS_MAX_ITEMS = 2
+NEWS_LOOKBACK_DAYS = 14
 # Use a realistic browser UA: services like rss.app block generic "bot" agents
 # (they return 403), which surfaced as "RSS'e ulaşılamıyor".
 USER_AGENT = (
@@ -314,8 +319,8 @@ JSON şeması:
 {{"recommendations": [
   {{"asset": "şirket adı", "ticker": "AAPL", "action": "al|sat|izle",
     "date": "GG.AA.YYYY", "entry_price": null, "target": null,
-    "conviction": "yüksek|orta|düşük", "thesis": "kısa gerekçe",
-    "source_quote": "ilgili alıntı"}}
+    "conviction": "yüksek|orta|düşük", "sector": "şirketin sektörü (Türkçe, ör. Yarı iletken / Teknoloji / Enerji / Finans / Sağlık)",
+    "thesis": "kısa gerekçe", "source_quote": "ilgili alıntı"}}
 ]}}
 
 Paylaşımlar:
@@ -535,6 +540,55 @@ def enrich_recommendations(recs):
     return recs
 
 
+def fetch_news(asset, ticker):
+    """Best-effort: most recent headlines for a stock via Google News RSS.
+    Single quick attempt; returns a short list of {title, date} or [] on any
+    failure (news must never block or slow down the report meaningfully)."""
+    query = quote_plus(f"{asset} {ticker} stock")
+    url = (f"https://news.google.com/rss/search?q={query}"
+           "&hl=en-US&gl=US&ceid=US:en")
+    try:
+        resp = requests.get(url, timeout=NEWS_TIMEOUT,
+                            headers={"User-Agent": USER_AGENT})
+        resp.raise_for_status()
+        parsed = feedparser.parse(resp.content)
+    except Exception as e:  # noqa: BLE001
+        log.warning("Haber alınamadı (%s): %s", ticker, str(e)[:120])
+        return []
+    cutoff = datetime.utcnow() - timedelta(days=NEWS_LOOKBACK_DAYS)
+    out = []
+    for entry in parsed.entries:
+        pub = entry.get("published_parsed") or entry.get("updated_parsed")
+        when = datetime.utcfromtimestamp(calendar.timegm(pub)) if pub else None
+        if when and when < cutoff:
+            continue
+        title = (entry.get("title") or "").strip()
+        if not title:
+            continue
+        # Google News appends " - Source"; keep it, it's useful provenance.
+        out.append({"title": title[:160],
+                    "date": (when + TR_OFFSET).strftime("%d.%m.%Y") if when else ""})
+        if len(out) >= NEWS_MAX_ITEMS:
+            break
+    return out
+
+
+def enrich_news(items):
+    """Attach recent headlines to each item in parallel (best-effort)."""
+    targets = items[:12]
+    if not targets:
+        return items
+    with ThreadPoolExecutor(max_workers=min(8, len(targets))) as ex:
+        futs = {ex.submit(fetch_news, it.get("asset") or it["ticker"], it["ticker"]): it
+                for it in targets}
+        for fut in futs:
+            try:
+                futs[fut]["news"] = fut.result()
+            except Exception:  # noqa: BLE001
+                futs[fut]["news"] = []
+    return items
+
+
 def _earliest_date(dates):
     """Earliest 'GG.AA.YYYY[ HH:MM]' string in a list (for 'since the call' math)."""
     best, best_s = None, ""
@@ -563,10 +617,12 @@ def merge_by_ticker(per_account):
                 continue
             g = groups.setdefault(tk, {
                 "ticker": tk, "asset": r.get("asset") or tk,
-                "entry_price": None, "_dates": [], "sources": [],
+                "sector": None, "entry_price": None, "_dates": [], "sources": [],
             })
             if (g["asset"] == tk) and r.get("asset"):
                 g["asset"] = r["asset"]
+            if not g["sector"] and r.get("sector"):
+                g["sector"] = r["sector"]
             if g["entry_price"] is None and r.get("entry_price"):
                 g["entry_price"] = r["entry_price"]
             if r.get("date"):
@@ -654,11 +710,13 @@ ikna edici, dönemin net çıkarımı ve pratik aksiyon.>
 
 Her KART formatı:
 *<badge(ler)> <ticker> · <asset>*
+🏷️ _Sektör:_ <sector>
 👥 _Kaynak:_ <her kaynak için "badge Hesap Adı: AKSİYON"; ortak ise "Her iki hesap da: AKSİYON">
 📈 _Fiyat:_ ~<entry_then> → *<current> <currency>* (<pct_change>%); S&P'ye karşı <alpha_vs_sp500> puan
 📊 _Teknik:_ RSI <rsi> · 50G <ma50> · 200G <ma200> · 52H <low52>–<high52> · hacim <vol_trend>
+📰 _Haber:_ <news listesindeki en önemli 1 başlığı Türkçe, kısa özetle + (tarih). news boşsa bu satırı YAZMA.>
 💬 _Tez:_ <kaynakların tezini 1 cümlede sentezle>
-🧠 _Analist görüşü:_ <1-2 cümle: kurulum + risk/ödül; konsensüste "iki bağımsız kaynağın da aynı yönde olması kanaati güçlendiriyor" vurgusu; ayrışmada hangisi daha sağlam>
+🧠 _Analist görüşü:_ <1-2 cümle: kurulum + risk/ödül; konsensüste "iki bağımsız kaynağın da aynı yönde olması kanaati güçlendiriyor" vurgusu; ayrışmada hangisi daha sağlam. Varsa haberin karara etkisini de belirt.>
 🎯 _Karar:_ *<GÜÇLÜ AL / AL / TUT / SAT>* — <tek cümle gerekçe>
 
 Kurallar:
@@ -667,6 +725,9 @@ Kurallar:
   aşağı, endeks gerisinde belirgin → SAT.
 - RSI>70 aşırı alım (GÜÇLÜ AL verme); fiyat 200G altındaysa trend zayıf; alpha negatifse
   "endeksin gerisinde", pozitifse "endeksi yendi" de.
+- Sektör (sector) null ise 🏷️ satırını yazma.
+- 📰 Haber satırı: SADECE verilen news başlıklarını kullan, haber UYDURMA. Başlık İngilizce
+  ise anlamını Türkçe ver. En güncel/önemli 1 başlık yeterli.
 - Bir değer null ise o metriği yazma; market null ise kartta sadece
   "ℹ️ Fiyat verisi alınamadı" yaz ve kararı tez/kanaat üzerinden ver.
 - UYDURMA: yalnızca verilen sayıları kullan, yeni fiyat türetme.
@@ -683,12 +744,14 @@ def verify_report(report, recs):
     corrected report, or the original if the check fails."""
     facts = json.dumps(
         [{"ticker": r.get("ticker"), "asset": r.get("asset"),
-          "date": r.get("date"), "market": r.get("market")} for r in recs],
+          "date": r.get("date"), "sector": r.get("sector"),
+          "news": r.get("news"), "market": r.get("market")} for r in recs],
         ensure_ascii=False,
     )
     system = ("Sen titiz bir finansal düzeltmensin. Görevin: rapordaki HER sayı ve "
               "tarihi verilen GERÇEK verilerle karşılaştırmak. Veride olmayan ya da "
-              "uyuşmayan her rakamı düzelt veya çıkar. Biçimi ve dili aynen koru. "
+              "uyuşmayan her rakamı düzelt veya çıkar. Sektör ve haber satırları veride "
+              "varsa KORU. Biçimi ve dili aynen koru. "
               "Sadece düzeltilmiş raporu döndür, açıklama ekleme.")
     user = f"""GERÇEK VERİ (doğru kabul et):
 {facts}
@@ -786,6 +849,10 @@ def analyze_combined(days, period_text, notify=None):
     # 4) Live market enrichment (parallel quotes for unique tickers).
     step(f"📈 {len(items)} hisse için canlı fiyatlar alınıyor...")
     enrich_recommendations(items)
+
+    # 4b) Recent per-stock headlines (best-effort, parallel).
+    step("📰 Güncel haberler taranıyor...")
+    enrich_news(items)
 
     # 5) Build the analyst report, then self-critique it.
     step("📝 Wall Street analisti raporu yazıyor...")
