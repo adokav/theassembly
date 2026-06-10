@@ -30,7 +30,7 @@ logging.basicConfig(
 log = logging.getLogger("assembly-bot")
 
 # Bump when shipping notable changes so /diag confirms which build is live.
-BUILD_TAG = "2026-06-09 tpm-budget"
+BUILD_TAG = "2026-06-10 combined"
 
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 
@@ -107,6 +107,12 @@ for _key, _name, _handle, _env, _default in _ACCOUNT_DEFS:
     if _key == "assembly":  # honor existing RSS_URL + RSS_FALLBACK_URLS too
         _feeds = list(dict.fromkeys(RSS_URLS + _feeds))
     ACCOUNTS[_key] = {"name": _name, "handle": _handle, "feeds": _feeds}
+
+# Colored badge per account, used to attribute each recommendation in the
+# combined report (first account 🟦, second 🟧, ...).
+_BADGE_POOL = ["🟦", "🟧", "🟩", "🟥", "🟪", "🟨"]
+ACCOUNT_BADGES = {key: _BADGE_POOL[i % len(_BADGE_POOL)]
+                  for i, key in enumerate(ACCOUNTS)}
 
 # Maximum Telegram message length is 4096; leave headroom for headers/markup.
 TELEGRAM_LIMIT = 3900
@@ -473,7 +479,7 @@ def enrich_recommendations(recs):
     """Attach live market context + technicals to each recommendation, plus an
     alpha (excess return vs the S&P 500) since the call date. All price fetches
     run in parallel so the report stays fast even with several tickers."""
-    targets = recs[:10]
+    targets = recs[:12]
     tickers = {(r.get("ticker") or "").strip().upper() for r in targets}
     tickers.discard("")
     tickers.add("SPY")  # benchmark
@@ -529,54 +535,145 @@ def enrich_recommendations(recs):
     return recs
 
 
-def build_report_with_market(recs, period_text, account_name):
-    """Pass 2: turn enriched structured data into a graded, Turkish report."""
-    payload = json.dumps({"period": period_text, "recommendations": recs}, ensure_ascii=False)
-    system = ("Sen profesyonel bir trading stratejistisin. Türkçe, net yazarsın. "
-              "Sana verilen yapılandırılmış veriyi ve GÜNCEL piyasa fiyatlarını kullan; "
-              "fiyat veya tarih UYDURMA. market alanı null ise fiyat yorumu yapma.")
-    user = f"""Aşağıda {account_name} hesabının {period_text} içindeki tavsiyeleri ve her biri
-için güncel piyasa verisi (JSON) var:
+def _earliest_date(dates):
+    """Earliest 'GG.AA.YYYY[ HH:MM]' string in a list (for 'since the call' math)."""
+    best, best_s = None, ""
+    for s in dates:
+        try:
+            d = datetime.strptime((s or "").split()[0], "%d.%m.%Y")
+        except Exception:  # noqa: BLE001
+            continue
+        if best is None or d < best:
+            best, best_s = d, s
+    return best_s or (dates[0] if dates else "")
+
+
+def merge_by_ticker(per_account):
+    """Collapse per-account recommendations into one item per ticker, tagging the
+    source account(s) and classifying each as consensus / divergence / single.
+
+    per_account: list of (account_key, account_name, [recs]).
+    Returns a list of merged items sorted so the report leads with consensus.
+    """
+    groups = {}
+    for key, name, recs in per_account:
+        for r in recs:
+            tk = (r.get("ticker") or "").strip().upper()
+            if not tk:
+                continue
+            g = groups.setdefault(tk, {
+                "ticker": tk, "asset": r.get("asset") or tk,
+                "entry_price": None, "_dates": [], "sources": [],
+            })
+            if (g["asset"] == tk) and r.get("asset"):
+                g["asset"] = r["asset"]
+            if g["entry_price"] is None and r.get("entry_price"):
+                g["entry_price"] = r["entry_price"]
+            if r.get("date"):
+                g["_dates"].append(r["date"])
+            g["sources"].append({
+                "account_key": key, "account": name,
+                "badge": ACCOUNT_BADGES.get(key, "•"),
+                "action": (r.get("action") or "izle").lower().strip(),
+                "conviction": r.get("conviction"),
+                "thesis": r.get("thesis"),
+                "date": r.get("date"),
+            })
+
+    items = []
+    for g in groups.values():
+        g["date"] = _earliest_date(g.pop("_dates"))
+        accounts = {s["account_key"] for s in g["sources"]}
+        actions = {s["action"] for s in g["sources"]}
+        if len(accounts) >= 2:
+            g["kind"] = "consensus" if len(actions) == 1 else "divergence"
+        else:
+            g["kind"] = "single"
+        items.append(g)
+
+    kind_rank = {"consensus": 0, "divergence": 1, "single": 2}
+    conv_rank = {"yüksek": 0, "orta": 1, "düşük": 2}
+
+    def sort_key(g):
+        best_conv = min((conv_rank.get((s.get("conviction") or "").lower(), 3)
+                         for s in g["sources"]), default=3)
+        return (kind_rank[g["kind"]], best_conv, g["ticker"])
+
+    items.sort(key=sort_key)
+    return items
+
+
+def build_combined_report(items, period_text, counts):
+    """Pass 2 (combined): a Wall-Street-analyst-style report across both accounts.
+    Consensus picks lead, then disagreements, then single-source ideas."""
+    accounts_meta = [
+        {"name": a["name"], "badge": ACCOUNT_BADGES[k], "post_count": counts.get(k, 0)}
+        for k, a in ACCOUNTS.items()
+    ]
+    payload = json.dumps({
+        "period": period_text,
+        "accounts": accounts_meta,
+        "consensus": [i for i in items if i["kind"] == "consensus"],
+        "divergence": [i for i in items if i["kind"] == "divergence"],
+        "singles": [i for i in items if i["kind"] == "single"],
+    }, ensure_ascii=False, default=str)
+
+    system = (
+        "Sen deneyimli bir Wall Street sell-side analistisin. Türkçe, net, ölçülü "
+        "yazarsın. Takip edilen X hesaplarının önerilerini bağımsız bir analist "
+        "gözüyle değerlendirirsin: kanaat, teknik kurulum, risk/ödül ve katalizör. "
+        "SADECE sana verilen sayıları kullan; fiyat/teknik/tarih UYDURMA. market "
+        "alanı null ise o varlık için fiyat/teknik yorumu yapma."
+    )
+    user = f"""Aşağıda iki X hesabının {period_text} içindeki hisse önerileri, kaynak
+etiketleriyle ve güncel piyasa verisiyle (JSON) birlikte verildi:
 
 {payload}
 
-Telegram'da okunacak, MOBİL DOSTU, taranabilir bir rapor yaz. Kısa satırlar, net,
-abartısız. TAM olarak şu yapıda:
+Telegram'da okunacak, MOBİL DOSTU, taranabilir TEK bir rapor yaz. Rozetleri aynen
+kullan (her hesabın badge'i payload'da). Her öneriyi bir analist gibi değerlendir ve
+şu KARAR ölçeğinden birini ver: *GÜÇLÜ AL* / *AL* / *TUT* / *SAT*.
 
-⚡ *ÖZET*
-<2 cümle: dönemin genel tonu + bugün en cazip fırsat hangisi>
+TAM olarak şu yapıda yaz:
 
-📋 *Tablo*
-Her tavsiye için tek satır (alınabilirliğe göre sırala: önce 🟢, sonra 🟡, en sonda 🔴):
-🟢/🟡/🔴 <ticker> — <pct_change>% (S&P'ye karşı <alpha_vs_sp500> puan)
+📊 *YÖNETİCİ ÖZETİ*
+<2-3 cümle: dönemin genel tonu, en yüksek kanaatli fikir, dikkat çeken risk>
 
-———
-Sonra her tavsiye için bir KART (yine 🟢→🟡→🔴 sırasıyla):
+━━━ 🤝 *ORTAK GÖRÜŞLER (KONSENSÜS)* ━━━
+(consensus listesi; her biri için KART. Liste boşsa bu bölümü "• Bu dönemde iki hesabın ortak önerisi yok." yaz.)
 
-*<emoji> <ticker> · <asset>*
-💬 _Tez:_ <thesis tek cümle>
-📅 _Tavsiye:_ <date> — <action>
-📈 _Fiyat:_ ~<entry_then> → *<current>* (<pct_change>%); S&P'ye karşı <alpha_vs_sp500> puan
+━━━ ⚖️ *GÖRÜŞ AYRILIĞI* ━━━
+(divergence listesi; aynı hisseye zıt görüş. Boşsa bu başlığı tamamen atla.)
+
+━━━ 📌 *TEKİL ÖNERİLER* ━━━
+(singles listesi; KART. Boşsa başlığı atla.)
+
+━━━ 🧭 *ANALİST GÖRÜŞÜ* ━━━
+<3-4 cümle sentez: konsensüs fikirler neden öne çıkıyor, hangi ayrışmada kim daha
+ikna edici, dönemin net çıkarımı ve pratik aksiyon.>
+
+Her KART formatı:
+*<badge(ler)> <ticker> · <asset>*
+👥 _Kaynak:_ <her kaynak için "badge Hesap Adı: AKSİYON"; ortak ise "Her iki hesap da: AKSİYON">
+📈 _Fiyat:_ ~<entry_then> → *<current> <currency>* (<pct_change>%); S&P'ye karşı <alpha_vs_sp500> puan
 📊 _Teknik:_ RSI <rsi> · 50G <ma50> · 200G <ma200> · 52H <low52>–<high52> · hacim <vol_trend>
-🎯 _Plan:_ Giriş <bölge> · Stop <seviye> · Hedef <seviye> → ~<R>R   (ya da net "bekle")
-🚦 _Karar:_ <🟢 Hâlâ alınır / 🟡 Geri çekilmede / 🔴 Geç kalındı> — <tek cümle gerekçe>
+💬 _Tez:_ <kaynakların tezini 1 cümlede sentezle>
+🧠 _Analist görüşü:_ <1-2 cümle: kurulum + risk/ödül; konsensüste "iki bağımsız kaynağın da aynı yönde olması kanaati güçlendiriyor" vurgusu; ayrışmada hangisi daha sağlam>
+🎯 _Karar:_ *<GÜÇLÜ AL / AL / TUT / SAT>* — <tek cümle gerekçe>
 
 Kurallar:
-- Stop'u VERİYE dayandır: stop ≈ giriş − (1.5 × atr). Hedef ile giriş/stop'tan R-katsayısını (ödül/risk) hesapla.
-- RSI > 70 aşırı alım (🟢 verme, geri çekilme bekle); RSI < 35 + tez sağlam = fırsat.
-- Fiyat 200G ortalamanın altındaysa trend zayıf, dikkat et.
-- alpha_vs_sp500 negatifse "endeksin gerisinde" diye belirt; pozitifse güçlü.
-- Karar mantığı: fiyat girişe yakın/altında, RSI aşırı değil, tez sağlam ve trend yukarı ise 🟢;
-  bir miktar kaçmış ama makulse 🟡; hedefi aşmış, 52H zirveye yapışmış, RSI>75 ya da tez bozuksa 🔴.
-- Bir değer null ise o metriği yazma; market alanı null ise kartta sadece "ℹ️ Fiyat verisi alınamadı" yaz.
-- UYDURMA: yalnızca verilen sayıları kullan; R ve stop dışında yeni sayı türetme.
-
-———
-✅ *BUGÜN NE YAPMALI*
-<sadece aksiyon: 1-3 madde, ör. "• NVDA: 950 altı topla, stop 900" / "• TSLA: bekle">"""
+- Karar ölçeği: konsensüs + teknik destek + makul RSI → GÜÇLÜ AL eğilimi. Tek kaynak ama
+  sağlam kurulum → AL. Fiyat çok kaçmış / RSI>75 / 52H zirvede → TUT. Tez bozulmuş, trend
+  aşağı, endeks gerisinde belirgin → SAT.
+- RSI>70 aşırı alım (GÜÇLÜ AL verme); fiyat 200G altındaysa trend zayıf; alpha negatifse
+  "endeksin gerisinde", pozitifse "endeksi yendi" de.
+- Bir değer null ise o metriği yazma; market null ise kartta sadece
+  "ℹ️ Fiyat verisi alınamadı" yaz ve kararı tez/kanaat üzerinden ver.
+- UYDURMA: yalnızca verilen sayıları kullan, yeni fiyat türetme.
+- Kısa satırlar, abartısız, profesyonel bir analist tonu."""
     return _llm_chat(
         [{"role": "system", "content": system}, {"role": "user", "content": user}],
-        max_tokens=2200, temperature=0.4,
+        max_tokens=2600, temperature=0.4,
     )
 
 
@@ -616,65 +713,86 @@ Düzeltilmiş raporu döndür:"""
         return report
 
 
-def _analyze_legacy(posts, period_text, account_name):
-    """Single-pass, text-only report. Fallback when structured extraction fails."""
-    text = "\n\n".join(
-        f"[{i+1}] Tarih: {p['date']}\nBaşlık: {p['title']}\nİçerik: {p['text']}\nLink: {p['link']}"
-        for i, p in enumerate(posts)
-    )
-    system = (
-        "Sen profesyonel bir makro analist ve trading stratejistisin. "
-        "Türkçe, net ve aksiyon odaklı yazarsın. "
-        "ÇOK ÖNEMLİ: Yalnızca sana verilen paylaşımlarda AÇIKÇA geçen hisse, kripto ve "
-        "varlıkları kullan. Paylaşımlarda olmayan bir varlık, fiyat, seviye ya da TARİH "
-        "UYDURMA. Her öneri için, o önerinin geçtiği paylaşımın TARİH ve SAATİNİ aynen kullan."
-    )
-    user = f"""{account_name} hesabının **{period_text}** içindeki paylaşımlarını analiz et.
-
-{text}
-
-Her tavsiye için: **Varlık** · 🗓 Tarih/Saat · 💡 Tavsiye · 🧭 Gerekçe · ⚠️ Risk.
-Sonda: **📌 Genel Stratejik Görünüm**.
-Somut sinyal yoksa "Bu dönemde belirgin bir yatırım sinyali tespit edilmedi" yaz."""
-    return _llm_chat(
-        [{"role": "system", "content": system}, {"role": "user", "content": user}],
-        max_tokens=1500, temperature=0.4,
-    )
+def _llm_error_message(e):
+    """Map a provider exception to a friendly Turkish message."""
+    msg = str(e)
+    low = msg.lower()
+    if any(k in low for k in ("403", "credit", "permission", "quota", "insufficient")):
+        return (
+            f"❌ Yapay zeka sağlayıcısı ({LLM_PROVIDER}) isteği reddetti: kredi/limit "
+            f"veya yetki sorunu görünüyor. API anahtarının doğru ve bakiyenin yeterli "
+            f"olduğundan emin olun.\n\nDetay: {msg[:200]}"
+        )
+    if any(k in low for k in ("rate limit", "429", "tpm", "tokens per minute")):
+        return (
+            "❌ Yapay zeka sağlayıcısı dakikalık limiti aştı (rate limit). Lütfen kısa "
+            "dönem seçin ya da bir dakika sonra tekrar deneyin."
+        )
+    return f"❌ Yapay zeka analiz hatası ({LLM_PROVIDER}/{LLM_MODEL}): {msg[:200]}"
 
 
-def analyze_posts(posts, period_text, account_name="The Assembly", notify=None):
+def analyze_combined(days, period_text, notify=None):
+    """Combined pipeline across all tracked accounts:
+    fetch (parallel) -> extract per account (attributed) -> merge & classify
+    (consensus/divergence/single) -> live market enrichment -> Wall-Street-style
+    report -> self-critique. Returns a result dict (see run_report) or None when
+    no posts could be fetched at all.
+    """
     def step(msg):
-        """Push a live progress line to the status message (best-effort)."""
         if notify:
             try:
                 notify(msg)
             except Exception:  # noqa: BLE001
                 pass
-    if not posts:
-        return "Bu dönemde analiz edilecek paylaşım bulunamadı."
-    try:
-        step(f"🧠 {len(posts)} paylaşım yapay zekayla ayıklanıyor...")
-        recs = extract_recommendations(posts)
-        if recs:
-            step(f"📈 {len(recs)} öneri için canlı fiyatlar alınıyor...")
-            enrich_recommendations(recs)
-            step("📝 Stratejik rapor yazılıyor...")
-            report = build_report_with_market(recs, period_text, account_name)
-            step("🔍 Rapor doğrulanıyor (son kontrol)...")
-            return verify_report(report, recs)  # self-critique / anti-hallucination
-        step("📝 Rapor yazılıyor...")
-        return _analyze_legacy(posts, period_text, account_name)
-    except Exception as e:  # noqa: BLE001
-        log.exception("LLM analiz hatası (%s/%s)", LLM_PROVIDER, LLM_MODEL)
-        msg = str(e)
-        low = msg.lower()
-        if any(k in low for k in ("403", "credit", "permission", "quota", "insufficient")):
-            return (
-                f"❌ Yapay zeka sağlayıcısı ({LLM_PROVIDER}) isteği reddetti: kredi/limit "
-                f"veya yetki sorunu görünüyor. Hesabınızda bakiye olduğundan ve API "
-                f"anahtarının doğru olduğundan emin olun.\n\nDetay: {msg[:200]}"
-            )
-        return f"❌ Yapay zeka analiz hatası ({LLM_PROVIDER}/{LLM_MODEL}): {msg[:200]}"
+
+    # 1) Fetch every account's posts in parallel.
+    step("📥 Paylaşımlar çekiliyor (2 hesap)...")
+    fetched = {}
+    with ThreadPoolExecutor(max_workers=max(1, len(ACCOUNTS))) as ex:
+        futs = {ex.submit(get_recent_posts, days, a["feeds"]): key
+                for key, a in ACCOUNTS.items()}
+        for fut in futs:
+            key = futs[fut]
+            try:
+                fetched[key] = fut.result()
+            except Exception as e:  # noqa: BLE001
+                log.warning("Fetch hatası (%s): %s", key, str(e)[:160])
+                fetched[key] = ([], "feed_unreachable")
+
+    counts = {key: len(fetched[key][0]) for key in ACCOUNTS}
+    if sum(counts.values()) == 0:
+        return None  # nothing fetched -> caller shows a 'no posts' notice
+
+    # 2) Extract recommendations per account (keeps attribution + smaller requests).
+    per_account = []
+    for key, a in ACCOUNTS.items():
+        posts = fetched[key][0]
+        if not posts:
+            per_account.append((key, a["name"], []))
+            continue
+        step(f"🧠 {a['name']}: {len(posts)} paylaşım ayıklanıyor...")
+        try:
+            recs = extract_recommendations(posts)
+        except Exception as e:  # noqa: BLE001 - one account failing shouldn't sink the report
+            log.warning("Çıkarım hatası (%s): %s", key, str(e)[:160])
+            recs = []
+        per_account.append((key, a["name"], recs))
+
+    # 3) Merge by ticker + classify.
+    items = merge_by_ticker(per_account)
+    if not items:
+        return {"empty": True, "counts": counts}
+
+    # 4) Live market enrichment (parallel quotes for unique tickers).
+    step(f"📈 {len(items)} hisse için canlı fiyatlar alınıyor...")
+    enrich_recommendations(items)
+
+    # 5) Build the analyst report, then self-critique it.
+    step("📝 Wall Street analisti raporu yazıyor...")
+    report = build_combined_report(items, period_text, counts)
+    step("🔍 Rapor doğrulanıyor (son kontrol)...")
+    report = verify_report(report, items)
+    return {"report": report, "counts": counts, "items": items}
 
 
 # ---------------------------------------------------------------------------
@@ -720,42 +838,37 @@ def safe_send(chat_id, text, edit_message_id=None):
 # ---------------------------------------------------------------------------
 # Telegram handlers
 # ---------------------------------------------------------------------------
-# Period buttons (label -> days). Used by the persistent reply keyboard.
+# Period buttons (label -> days). The persistent keyboard now offers periods
+# directly: one tap produces a single combined report across all accounts.
 PERIOD_BUTTONS = {
-    "🔥 Son 1 Gün": 1,
-    "🔥 Son 2 Gün": 2,
-    "🔥 Son 3 Gün": 3,
+    "📈 Son 1 Gün": 1,
+    "📈 Son 2 Gün": 2,
+    "📈 Son 3 Gün": 3,
     "📅 Son 1 Hafta": 7,
     "📅 Son 2 Hafta": 14,
     "📊 Geçtiğimiz Ay": 30,
 }
 
 
-# Persistent keyboard buttons -> account key. One button per tracked account.
-ACCOUNT_BUTTONS = {f"📈 {a['name']}": key for key, a in ACCOUNTS.items()}
-
-
-def _account_keyboard():
-    """Persistent keyboard listing tracked accounts (pinned at the bottom)."""
+def _period_keyboard():
+    """Persistent keyboard of period buttons (two per row)."""
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True, is_persistent=True)
-    for label in ACCOUNT_BUTTONS:
-        kb.row(label)
+    labels = list(PERIOD_BUTTONS)
+    for i in range(0, len(labels), 2):
+        kb.row(*labels[i:i + 2])
     return kb
 
 
-def _period_inline(account_key):
-    """Inline period buttons; callback_data carries account + days."""
-    kb = types.InlineKeyboardMarkup(row_width=2)
-    kb.add(*[types.InlineKeyboardButton(lbl, callback_data=f"{account_key}:{days}")
-             for lbl, days in PERIOD_BUTTONS.items()])
-    return kb
+def _account_names():
+    return " + ".join(a["name"] for a in ACCOUNTS.values())
 
 
 def show_menu(chat_id, title=None):
     if title is None:
-        title = "🎯 *Stratejik Rapor Botu*\n\nTakip edilen bir hesap seç:"
+        title = (f"🎯 *Stratejik Rapor Botu*\n\n{_account_names()} önerilerini tek raporda, "
+                 "bir Wall Street analisti gözüyle birleştirir.\n\nHangi dönemi raporlayalım?")
     title += f"\n\n🤖 _Aktif AI: {LLM_PROVIDER} · {LLM_MODEL}_"
-    bot.send_message(chat_id, title, reply_markup=_account_keyboard(), parse_mode="Markdown")
+    bot.send_message(chat_id, title, reply_markup=_period_keyboard(), parse_mode="Markdown")
 
 
 @bot.message_handler(commands=["start", "rapor"])
@@ -763,14 +876,9 @@ def send_menu(message):
     show_menu(message.chat.id)
 
 
-@bot.message_handler(func=lambda m: m.text in ACCOUNT_BUTTONS)
-def account_button_handler(message):
-    key = ACCOUNT_BUTTONS[message.text]
-    bot.send_message(
-        message.chat.id,
-        f"📊 *{ACCOUNTS[key]['name']}* — hangi dönemi raporlayalım?",
-        reply_markup=_period_inline(key), parse_mode="Markdown",
-    )
+@bot.message_handler(func=lambda m: m.text in PERIOD_BUTTONS)
+def period_button_handler(message):
+    run_report(message.chat.id, PERIOD_BUTTONS[message.text])
 
 
 @bot.message_handler(commands=["diag"])
@@ -839,14 +947,17 @@ def _period_text(days):
     return "Geçtiğimiz Ay"
 
 
-def run_report(chat_id, account_key, days):
-    """Fetch a tracked account's posts, analyze, and deliver the graded report."""
-    account = ACCOUNTS.get(account_key) or ACCOUNTS.get("assembly")
-    name = account["name"]
+def _post_counts_line(counts):
+    return " · ".join(f"{ACCOUNTS[k]['name']}: {v} paylaşım" for k, v in counts.items())
+
+
+def run_report(chat_id, days):
+    """Fetch all accounts' posts, build the combined analyst report, deliver it."""
     period_text = _period_text(days)
-    log.info("Rapor isteği: %s · %s gün", name, days)
+    names = _account_names()
+    log.info("Rapor isteği: %s · %s gün", names, days)
     status = bot.send_message(
-        chat_id, f"🔄 *{name}* · {period_text} analiz ediliyor... (10-40 sn)",
+        chat_id, f"🔄 *{names}* · {period_text}\nHazırlanıyor... (15-50 sn)",
         parse_mode="Markdown",
     )
     status_id = status.message_id
@@ -854,56 +965,53 @@ def run_report(chat_id, account_key, days):
     def notify(msg):
         """Edit the status message so the user sees live progress / where it stalls."""
         bot.edit_message_text(
-            f"🔄 *{name}* · {period_text}\n{msg}", chat_id, status_id,
+            f"🔄 *{names}* · {period_text}\n{msg}", chat_id, status_id,
             parse_mode="Markdown",
         )
 
     try:
-        notify("📥 Paylaşımlar kaynaktan (RSS) çekiliyor...")
-        posts, error = get_recent_posts(days, account["feeds"])
+        result = analyze_combined(days, period_text, notify=notify)
 
-        if error == "feed_unreachable":
+        if result is None:
             bot.edit_message_text(
-                f"⚠️ *{name}* için paylaşım kaynağına (RSS) ulaşılamıyor. "
-                "Bu hesabın RSS adresi tanımlı olmayabilir ya da kaynak geçici kapalıdır.",
+                f"⚠️ *{period_text}* için paylaşım kaynaklarına ulaşılamadı ya da bu "
+                "dönemde hiç paylaşım yok. Daha geniş bir dönem deneyin.",
                 chat_id, status_id, parse_mode="Markdown",
             )
             return
 
-        analysis = analyze_posts(posts, period_text, name, notify=notify)
-        header = f"📊 *{name} — {period_text} Stratejik Rapor*\n"
-        if posts:
-            header += f"_({len(posts)} paylaşım analiz edildi)_\n\n"
-        else:
-            header += "\n"
-
-        result = header + analysis + DISCLAIMER
-        safe_send(chat_id, result, edit_message_id=status_id)
-    except Exception as e:  # noqa: BLE001 - never fail silently
-        log.exception("run_report hatası (%s, %s gün)", name, days)
-        try:
+        if result.get("empty"):
             bot.edit_message_text(
-                f"❌ Rapor üretilirken hata oluştu: {str(e)[:200]}",
-                chat_id, status_id,
+                f"📊 *{period_text}* — somut bir hisse önerisi tespit edilemedi.\n"
+                f"_({_post_counts_line(result['counts'])} tarandı)_",
+                chat_id, status_id, parse_mode="Markdown",
             )
+            return
+
+        header = (f"📊 *{period_text.upper()} STRATEJİ RAPORU*\n{names}\n"
+                  f"_({_post_counts_line(result['counts'])})_\n\n")
+        out = header + result["report"] + DISCLAIMER
+        safe_send(chat_id, out, edit_message_id=status_id)
+    except Exception as e:  # noqa: BLE001 - never fail silently
+        log.exception("run_report hatası (%s gün)", days)
+        friendly = _llm_error_message(e)
+        try:
+            bot.edit_message_text(friendly, chat_id, status_id)
         except Exception:  # noqa: BLE001
-            bot.send_message(chat_id, f"❌ Rapor hatası: {str(e)[:200]}")
+            bot.send_message(chat_id, friendly)
 
 
 @bot.callback_query_handler(func=lambda call: True)
 def callback_handler(call):
+    """Back-compat for any old inline period buttons still in chat history."""
     log.info("Callback alındı: %s", call.data)
     try:
         bot.answer_callback_query(call.id)
     except Exception:  # noqa: BLE001
         pass
-    data = call.data or ""
-    if ":" in data:
-        key, _, d = data.partition(":")
-        days = int(d) if d.isdigit() else 1
-    else:  # legacy inline buttons (bare day count) -> default account
-        key, days = "assembly", (int(data) if data.isdigit() else 1)
-    run_report(call.message.chat.id, key, days)
+    d = (call.data or "").split(":")[-1]
+    days = int(d) if d.isdigit() else 7
+    run_report(call.message.chat.id, days)
 
 
 WEBHOOK_PATH = f"/webhook/{TOKEN}" if TOKEN else "/webhook"
