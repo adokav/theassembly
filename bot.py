@@ -30,7 +30,7 @@ logging.basicConfig(
 log = logging.getLogger("assembly-bot")
 
 # Bump when shipping notable changes so /diag confirms which build is live.
-BUILD_TAG = "2026-06-09 fix-period"
+BUILD_TAG = "2026-06-09 tpm-budget"
 
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 
@@ -114,6 +114,11 @@ TELEGRAM_LIMIT = 3900
 TR_OFFSET = timedelta(hours=3)
 HTTP_TIMEOUT = 20
 HTTP_RETRIES = 4
+# LLM input budget (free tiers like Groq cap tokens-per-minute). Roughly
+# 1 token ≈ 3-4 chars, so ~14k chars keeps the extraction request well under a
+# 12k TPM ceiling while leaving room for the report + verify passes.
+MAX_POST_CHARS = 700
+EXTRACT_CHAR_BUDGET = 14000
 # Use a realistic browser UA: services like rss.app block generic "bot" agents
 # (they return 403), which surfaced as "RSS'e ulaşılamıyor".
 USER_AGENT = (
@@ -280,14 +285,22 @@ def _parse_json(raw):
 
 
 def extract_recommendations(posts):
-    """Pass 1: pull concrete, grounded recommendations as structured JSON."""
-    text = "\n\n".join(
-        f"[{i+1}] Tarih: {p['date']}\nBaşlık: {p['title']}\nİçerik: {p['text']}"
-        for i, p in enumerate(posts)
-    )
+    """Pass 1: pull concrete, grounded recommendations as structured JSON.
+
+    Free LLM tiers (e.g. Groq) cap tokens-per-minute, so a week of long-form
+    posts can exceed the per-request limit (HTTP 413 'Request too large'). We
+    cap each post's length and the total input size, then shrink-and-retry if
+    the provider still rejects the request as too large."""
     system = ("Sen bir finansal metin çıkarım motorusun. SADECE geçerli JSON döndür. "
               "Paylaşımlarda olmayan hiçbir varlık, fiyat veya tarih uydurma.")
-    user = f"""Aşağıdaki paylaşımlardan SOMUT hisse/varlık tavsiyelerini çıkar.
+
+    def build_user(items):
+        text = "\n\n".join(
+            f"[{i+1}] Tarih: {p['date']}\nBaşlık: {p['title']}\n"
+            f"İçerik: {(p['text'] or '')[:MAX_POST_CHARS]}"
+            for i, p in enumerate(items)
+        )
+        return f"""Aşağıdaki paylaşımlardan SOMUT hisse/varlık tavsiyelerini çıkar.
 Sadece ABD/global borsalarda işlem gören hisseler için Yahoo Finance sembolü ver
 (ör. Apple -> AAPL, Nvidia -> NVDA). Net sembol çıkaramıyorsan o kaydı atla.
 
@@ -303,10 +316,35 @@ Paylaşımlar:
 {text}
 
 Yalnızca JSON döndür."""
-    raw = _llm_chat(
-        [{"role": "system", "content": system}, {"role": "user", "content": user}],
-        max_tokens=1500, temperature=0.2, json_mode=True,
-    )
+
+    # Trim to a character budget so the request stays under the TPM limit.
+    items, total = [], 0
+    for p in posts:
+        approx = min(len(p.get("text") or ""), MAX_POST_CHARS) + 80
+        if items and total + approx > EXTRACT_CHAR_BUDGET:
+            break
+        items.append(p)
+        total += approx
+    if len(items) < len(posts):
+        log.info("Extraction bütçesi: %d/%d paylaşım gönderiliyor", len(items), len(posts))
+
+    raw = None
+    while items:
+        try:
+            raw = _llm_chat(
+                [{"role": "system", "content": system},
+                 {"role": "user", "content": build_user(items)}],
+                max_tokens=1500, temperature=0.2, json_mode=True,
+            )
+            break
+        except Exception as e:  # noqa: BLE001
+            msg = str(e).lower()
+            too_big = "413" in msg or "too large" in msg or "tpm" in msg or "tokens per minute" in msg
+            if too_big and len(items) > 3:
+                items = items[: max(3, len(items) // 2)]
+                log.warning("LLM isteği çok büyük; paylaşım sayısı %d'e düşürülüp tekrar deneniyor", len(items))
+                continue
+            raise
     data = _parse_json(raw) or {}
     recs = data.get("recommendations", [])
     return recs if isinstance(recs, list) else []
