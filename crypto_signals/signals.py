@@ -47,6 +47,28 @@ def _clamp(x: float, lo: float = -1.0, hi: float = 1.0) -> float:
     return max(lo, min(hi, x))
 
 
+# Structural signals whose reversal counts as a "formation breakdown".
+STRUCTURAL_SIGNALS = {"Trend (HO)", "Golden/Death Cross", "MACD", "Kırılım"}
+
+
+def is_bullish_signal(rep: "SignalReport", threshold: float) -> bool:
+    """A coin 'generates a signal' when its confluence clears the entry bar."""
+    return rep.composite >= threshold
+
+
+def broken_reasons(rep: "SignalReport") -> list[str]:
+    """Structural signals that have turned clearly bearish (formation breaking)."""
+    return [s.verdict for s in rep.signals if s.name in STRUCTURAL_SIGNALS and s.score <= -0.3]
+
+
+def is_formation_broken(rep: "SignalReport", exit_threshold: float) -> bool:
+    """An active signal is broken once it leaves the strong zone AND either the
+    composite falls under the exit band or a structural element reverses."""
+    if rep.rating == "GÜÇLÜ":
+        return False
+    return rep.composite < exit_threshold or bool(broken_reasons(rep))
+
+
 # --- individual evaluators --------------------------------------------------
 
 def _eval_ma_trend(closes: list[float]) -> Signal:

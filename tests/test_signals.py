@@ -7,10 +7,22 @@ from crypto_signals import indicators as ind
 from crypto_signals.signals import (
     Signal,
     SignalEngine,
+    SignalReport,
     _eval_ma_trend,
     _eval_rsi,
     _rate,
+    broken_reasons,
+    is_bullish_signal,
+    is_formation_broken,
 )
+
+
+def _report(composite, rating, signals=None):
+    return SignalReport(
+        symbol="X", price=100.0, signals=signals or [],
+        composite=composite, bullish_pct=(composite + 1) / 2 * 100,
+        rating=rating, emoji="🟢",
+    )
 
 
 def test_sma_basic():
@@ -73,3 +85,27 @@ def test_composite_weighted_average():
     ]
     # (1*2 + -1*1) / 3 = 0.333...
     assert math.isclose(SignalEngine._composite(signals), 1 / 3, rel_tol=1e-9)
+
+
+def test_is_bullish_signal_threshold():
+    assert is_bullish_signal(_report(0.40, "GÜÇLÜ"), 0.35)
+    assert not is_bullish_signal(_report(0.20, "NÖTR"), 0.35)
+
+
+def test_formation_not_broken_while_strong():
+    # Still GÜÇLÜ -> never considered broken even with a low exit threshold.
+    assert not is_formation_broken(_report(0.50, "GÜÇLÜ"), 0.15)
+
+
+def test_formation_broken_on_composite_drop():
+    assert is_formation_broken(_report(0.05, "NÖTR"), 0.15)
+
+
+def test_formation_broken_on_structural_reversal():
+    # Composite still mildly positive but a structural signal reversed.
+    rep = _report(0.18, "NÖTR", signals=[
+        Signal("Trend (HO)", -0.6, 1.5, "düşen trend"),
+        Signal("RSI", 0.2, 1.0, "nötr"),
+    ])
+    assert is_formation_broken(rep, 0.15)
+    assert broken_reasons(rep) == ["düşen trend"]

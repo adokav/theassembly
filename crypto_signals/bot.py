@@ -100,7 +100,8 @@ class CryptoSignalsBot:
                 "• `/ekle SOL` · `/sil SOL` — takip listesi\n"
                 "• `/liste` — watchlist özeti\n"
                 "• Alttaki butonlarla tek dokunuşla analiz al.\n\n"
-                "Periyodik tarama açık: güçlü sinyal oluşunca otomatik haber veririm.",
+                "Periyodik tarama açık: bir coin *sinyal üretince* otomatik rapor "
+                "gönderir, sonra *formasyonu bozulursa* yine otomatik haber veririm.",
                 parse_mode="Markdown",
                 reply_markup=self._keyboard(chat_id),
             )
@@ -112,6 +113,7 @@ class CryptoSignalsBot:
                 "*Komutlar*\n"
                 "`/sinyal <SEMBOL>` — anlık sinyal raporu (örn. `/sinyal ETH`)\n"
                 "`/radar` — son taramadaki en güçlü boğa sinyalleri\n"
+                "`/aktif` — açık (izlenen) sinyaller\n"
                 "`/ekle <SEMBOL>` — takip listesine ekle\n"
                 "`/sil <SEMBOL>` — listeden çıkar\n"
                 "`/liste` — watchlist özeti\n"
@@ -182,6 +184,24 @@ class CryptoSignalsBot:
                 emoji = "🟢" if r["composite"] >= 0.30 else "🟡"
                 lines.append(f"{emoji} *{r['symbol']}* — {r['rating']} · skor `{r['composite']:+.2f}`")
             lines.append("\n_Detay için: `/sinyal <SEMBOL>`. Yatırım tavsiyesi değildir._")
+            self.safe_send(message.chat.id, "\n".join(lines))
+
+        @bot.message_handler(commands=["aktif", "active"])
+        def _active(message):
+            rows = self.repo.list_active_signals(message.chat.id)
+            if not rows:
+                self.bot.send_message(
+                    message.chat.id,
+                    "Şu an açık (izlenen) sinyalin yok. Bir coin sinyal üretince "
+                    "otomatik haber veririm; formasyonu bozulursa yine bildiririm.",
+                )
+                return
+            lines = [f"🟢 *Açık sinyaller ({len(rows)})* — formasyonu bozulursa haber veririm:", ""]
+            for r in rows:
+                lines.append(
+                    f"• *{r['symbol']}* — giriş `{r['entry_price']:.6g}` "
+                    f"(skor `{r['entry_composite']:+.2f}`)"
+                )
             self.safe_send(message.chat.id, "\n".join(lines))
 
         @bot.message_handler(commands=["korku", "fng"])
@@ -273,6 +293,7 @@ class CryptoSignalsBot:
                 types.BotCommand("start", "Başlat ve menüyü göster"),
                 types.BotCommand("sinyal", "Bir coin için anlık sinyal"),
                 types.BotCommand("radar", "En güçlü boğa sinyalleri (son tarama)"),
+                types.BotCommand("aktif", "Açık (izlenen) sinyaller"),
                 types.BotCommand("ekle", "Takip listesine sembol ekle"),
                 types.BotCommand("sil", "Takip listesinden çıkar"),
                 types.BotCommand("liste", "Watchlist özeti"),

@@ -47,12 +47,31 @@ def render_report(rep: SignalReport, *, with_disclaimer: bool = True) -> str:
     return "\n".join(lines)
 
 
-def render_alert(rep: SignalReport, previous: str | None) -> str:
-    arrow = ""
-    if previous:
-        arrow = f" ({previous} → {rep.rating})"
-    head = f"🔔 *Sinyal değişimi*{arrow}\n\n"
+def render_new_signal(rep: SignalReport) -> str:
+    """Auto-report sent when a coin first generates a signal."""
+    head = f"🟢🔔 *YENİ SİNYAL* — *{rep.symbol}* sinyal üretti!\n\n"
     return head + render_report(rep)
+
+
+def render_broken(rep: SignalReport, entry: dict, reasons: list[str]) -> str:
+    """Auto-report sent when a previously-signaled coin's formation breaks."""
+    entry_price = entry.get("entry_price") or 0.0
+    pct = ((rep.price - entry_price) / entry_price * 100) if entry_price else 0.0
+    lines = [
+        f"🔻⚠️ *FORMASYON BOZULDU* — *{rep.symbol}*",
+        "",
+        f"Sinyal sonrası: `{_fmt_price(entry_price)}` → `{_fmt_price(rep.price)}` "
+        f"({'+' if pct >= 0 else ''}{pct:.1f}%)",
+    ]
+    if reasons:
+        lines.append("")
+        lines.append("*Bozulan formasyon:*")
+        for r in reasons:
+            lines.append(f"🔴 {r}")
+    lines.append("")
+    lines.append(f"📊 Güncel kompozit skor: `{rep.composite:+.2f}` → sinyal kapatıldı.")
+    lines.append(DISCLAIMER)
+    return "\n".join(lines)
 
 
 def render_watchlist_summary(reports: list[SignalReport]) -> str:

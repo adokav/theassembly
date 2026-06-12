@@ -13,9 +13,15 @@ import time
 from typing import Callable
 
 from .config import Config
-from .formatting import render_alert
+from .formatting import render_broken, render_new_signal
 from .providers import is_scannable_base
-from .signals import SignalEngine, SignalReport
+from .signals import (
+    SignalEngine,
+    SignalReport,
+    broken_reasons,
+    is_bullish_signal,
+    is_formation_broken,
+)
 from .storage import Repository
 
 log = logging.getLogger("crypto_signals.scheduler")
@@ -96,23 +102,32 @@ class SignalScheduler:
                 log.warning("%s değerlendirilemedi: %s", symbol, str(e)[:160])
                 continue
             self.repo.save_snapshot(symbol, rep.composite, rep.rating, _payload(rep))
-            self._maybe_alert(symbol, rep, chat_ids)
+            self._process_signal(symbol, rep, chat_ids)
             # Gentle throttle so a 150-coin scan stays well under rate limits.
             self._stop.wait(0.15)
 
-    def _maybe_alert(self, symbol: str, rep: SignalReport, chat_ids: list[int]) -> None:
+    def _process_signal(self, symbol: str, rep: SignalReport, chat_ids: list[int]) -> None:
+        """Signal lifecycle per subscriber:
+        - not active + bullish  -> auto-report 'YENİ SİNYAL', open the signal
+        - active + broken        -> auto-report 'FORMASYON BOZULDU', close it
+        """
+        bullish = is_bullish_signal(rep, self.cfg.alert_score_threshold)
+        broken = is_formation_broken(rep, self.cfg.signal_exit_threshold)
         for chat_id in chat_ids:
-            previous = self.repo.get_last_rating(chat_id, symbol)
-            self.repo.set_last_rating(chat_id, symbol, rep.rating)
-            if previous == rep.rating:
-                continue  # no transition -> stay quiet
-            # Alert when entering a strong signal, or leaving one (state change).
-            meaningful = rep.rating == "GÜÇLÜ" or previous == "GÜÇLÜ" or rep.rating == "ZAYIF"
-            if previous is not None and meaningful:
-                try:
-                    self.notify(chat_id, render_alert(rep, previous))
-                except Exception as e:  # noqa: BLE001
-                    log.warning("Alarm gönderilemedi (chat %s): %s", chat_id, str(e)[:160])
+            active = self.repo.is_active_signal(chat_id, symbol)
+            if not active and bullish:
+                self.repo.open_signal(chat_id, symbol, rep.price, rep.composite)
+                self._safe_notify(chat_id, render_new_signal(rep))
+            elif active and broken:
+                entry = self.repo.get_active_signal(chat_id, symbol) or {}
+                self.repo.close_signal(chat_id, symbol)
+                self._safe_notify(chat_id, render_broken(rep, entry, broken_reasons(rep)))
+
+    def _safe_notify(self, chat_id: int, text: str) -> None:
+        try:
+            self.notify(chat_id, text)
+        except Exception as e:  # noqa: BLE001
+            log.warning("Otomatik rapor gönderilemedi (chat %s): %s", chat_id, str(e)[:160])
 
 
 def _payload(rep: SignalReport) -> dict:

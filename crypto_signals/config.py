@@ -44,7 +44,11 @@ class Config:
 
     # --- scheduler ---
     scan_interval_min: int = field(default_factory=lambda: int(os.getenv("SCAN_INTERVAL_MIN") or "30"))
+    # Entry: a coin auto-reports as a new signal when composite >= this.
     alert_score_threshold: float = field(default_factory=lambda: float(os.getenv("ALERT_SCORE_THRESHOLD") or "0.35"))
+    # Exit (hysteresis): an active signal is "broken" once composite drops below
+    # this (or a structural element breaks). Kept under the entry to avoid flapping.
+    signal_exit_threshold: float = field(default_factory=lambda: float(os.getenv("SIGNAL_EXIT_THRESHOLD") or "0.15"))
 
     # --- HTTP ---
     http_timeout: int = 20
@@ -70,6 +74,8 @@ class Config:
             raise ConfigError("DYNAMIC_TOP_N negatif olamaz (0 = devre dışı).")
         if not (0.0 < self.alert_score_threshold <= 1.0):
             raise ConfigError("ALERT_SCORE_THRESHOLD 0 ile 1 arasında olmalı.")
+        if not (-1.0 <= self.signal_exit_threshold < self.alert_score_threshold):
+            raise ConfigError("SIGNAL_EXIT_THRESHOLD, ALERT_SCORE_THRESHOLD'dan küçük olmalı.")
 
 
 def load_config() -> Config:

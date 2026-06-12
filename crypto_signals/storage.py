@@ -30,11 +30,12 @@ CREATE TABLE IF NOT EXISTS snapshots (
     payload    TEXT    NOT NULL,
     PRIMARY KEY (symbol, ts)
 );
-CREATE TABLE IF NOT EXISTS alert_state (
-    chat_id     INTEGER NOT NULL,
-    symbol      TEXT    NOT NULL,
-    last_rating TEXT    NOT NULL,
-    last_ts     INTEGER NOT NULL,
+CREATE TABLE IF NOT EXISTS active_signals (
+    chat_id         INTEGER NOT NULL,
+    symbol          TEXT    NOT NULL,
+    entry_ts        INTEGER NOT NULL,
+    entry_price     REAL    NOT NULL,
+    entry_composite REAL    NOT NULL,
     PRIMARY KEY (chat_id, symbol)
 );
 """
@@ -130,20 +131,46 @@ class Repository:
             ).fetchall()
         return [dict(r) for r in rows]
 
-    # --- alert state -------------------------------------------------------
-    def get_last_rating(self, chat_id: int, symbol: str) -> str | None:
+    # --- active signals (lifecycle: open on entry, close on breakdown) -----
+    def is_active_signal(self, chat_id: int, symbol: str) -> bool:
         with self._lock:
             row = self._conn.execute(
-                "SELECT last_rating FROM alert_state WHERE chat_id = ? AND symbol = ?",
+                "SELECT 1 FROM active_signals WHERE chat_id = ? AND symbol = ?",
                 (chat_id, symbol.upper()),
             ).fetchone()
-        return row["last_rating"] if row else None
+        return row is not None
 
-    def set_last_rating(self, chat_id: int, symbol: str, rating: str) -> None:
+    def get_active_signal(self, chat_id: int, symbol: str) -> dict | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT chat_id, symbol, entry_ts, entry_price, entry_composite "
+                "FROM active_signals WHERE chat_id = ? AND symbol = ?",
+                (chat_id, symbol.upper()),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def open_signal(self, chat_id: int, symbol: str, price: float, composite: float) -> None:
         with self._lock:
             self._conn.execute(
-                "INSERT OR REPLACE INTO alert_state(chat_id, symbol, last_rating, last_ts) "
-                "VALUES (?, ?, ?, ?)",
-                (chat_id, symbol.upper(), rating, int(time.time())),
+                "INSERT OR REPLACE INTO active_signals"
+                "(chat_id, symbol, entry_ts, entry_price, entry_composite) VALUES (?, ?, ?, ?, ?)",
+                (chat_id, symbol.upper(), int(time.time()), price, composite),
             )
             self._conn.commit()
+
+    def close_signal(self, chat_id: int, symbol: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM active_signals WHERE chat_id = ? AND symbol = ?",
+                (chat_id, symbol.upper()),
+            )
+            self._conn.commit()
+
+    def list_active_signals(self, chat_id: int) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT symbol, entry_ts, entry_price, entry_composite "
+                "FROM active_signals WHERE chat_id = ? ORDER BY entry_ts DESC",
+                (chat_id,),
+            ).fetchall()
+        return [dict(r) for r in rows]
