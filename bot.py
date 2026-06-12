@@ -31,7 +31,7 @@ logging.basicConfig(
 log = logging.getLogger("assembly-bot")
 
 # Bump when shipping notable changes so /diag confirms which build is live.
-BUILD_TAG = "2026-06-10 sector-specific"
+BUILD_TAG = "2026-06-10 sector-real"
 
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 
@@ -489,17 +489,28 @@ def enrich_recommendations(recs):
     tickers.discard("")
     tickers.add("SPY")  # benchmark
     quotes = {}
+    sectors = {}
     if tickers:
-        with ThreadPoolExecutor(max_workers=min(8, len(tickers))) as ex:
-            futs = {ex.submit(fetch_quote, tk): tk for tk in tickers}
-            for fut in futs:
+        stock_tickers = [tk for tk in tickers if tk != "SPY"]
+        with ThreadPoolExecutor(max_workers=min(10, len(tickers) + len(stock_tickers))) as ex:
+            qf = {ex.submit(fetch_quote, tk): tk for tk in tickers}
+            sf = {ex.submit(fetch_sector, tk): tk for tk in stock_tickers}
+            for fut in qf:
                 try:
-                    quotes[futs[fut]] = fut.result()
+                    quotes[qf[fut]] = fut.result()
                 except Exception:  # noqa: BLE001
-                    quotes[futs[fut]] = None
+                    quotes[qf[fut]] = None
+            for fut in sf:
+                try:
+                    sectors[sf[fut]] = fut.result()
+                except Exception:  # noqa: BLE001
+                    sectors[sf[fut]] = None
     bench = quotes.get("SPY")
     for r in targets:
         tk = (r.get("ticker") or "").strip().upper()
+        # Prefer the real sector from Yahoo; fall back to the LLM's guess.
+        if tk and sectors.get(tk):
+            r["sector"] = sectors[tk]
         if not tk:
             r["market"] = None
             continue
@@ -538,6 +549,33 @@ def enrich_recommendations(recs):
             "currency": q.get("currency"),
         }
     return recs
+
+
+def fetch_sector(ticker):
+    """Real industry/sector from Yahoo's search endpoint (no crumb required).
+    Returns the most specific label available (English) or None. Best-effort:
+    a single quick attempt, used to OVERRIDE the LLM's guessed sector which can
+    be wrong for small/less-known names (e.g. TMDX is medical devices, not
+    semiconductors)."""
+    url = (f"https://query1.finance.yahoo.com/v1/finance/search"
+           f"?q={quote_plus(ticker)}&quotesCount=5&newsCount=0&listsCount=0")
+    try:
+        resp = requests.get(url, timeout=NEWS_TIMEOUT,
+                            headers={"User-Agent": USER_AGENT})
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:  # noqa: BLE001
+        log.warning("Sektör alınamadı (%s): %s", ticker, str(e)[:120])
+        return None
+    quotes = data.get("quotes") or []
+    tk = ticker.strip().upper()
+    match = next((q for q in quotes if (q.get("symbol") or "").upper() == tk), None)
+    if match is None:
+        match = next((q for q in quotes if q.get("quoteType") == "EQUITY"), None)
+    if not match:
+        return None
+    return (match.get("industryDisp") or match.get("industry")
+            or match.get("sectorDisp") or match.get("sector") or None)
 
 
 def fetch_news(asset, ticker):
@@ -725,7 +763,9 @@ Kurallar:
   aşağı, endeks gerisinde belirgin → SAT.
 - RSI>70 aşırı alım (GÜÇLÜ AL verme); fiyat 200G altındaysa trend zayıf; alpha negatifse
   "endeksin gerisinde", pozitifse "endeksi yendi" de.
-- Sektör (sector) null ise 🏷️ satırını yazma.
+- Sektör (sector) null ise 🏷️ satırını yazma. Sektör İngilizce geldiyse (ör.
+  "Medical Devices", "Semiconductors") Türkçeye çevirerek yaz ("Medikal Cihazlar",
+  "Yarı İletkenler"); anlamı KORU, kategoriyi değiştirme.
 - 📰 Haber satırı: SADECE verilen news başlıklarını kullan, haber UYDURMA. Başlık İngilizce
   ise anlamını Türkçe ver. En güncel/önemli 1 başlık yeterli.
 - Bir değer null ise o metriği yazma; market null ise kartta sadece
