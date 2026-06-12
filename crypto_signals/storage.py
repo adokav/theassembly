@@ -112,6 +112,24 @@ class Repository:
             )
             self._conn.commit()
 
+    def latest_snapshots(self, limit: int = 15, min_composite: float = 0.30) -> list[dict]:
+        """Most recent snapshot per symbol with composite >= threshold,
+        strongest first. Powers the /radar command from the last scan."""
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT s.symbol, s.composite, s.rating, s.ts
+                FROM snapshots s
+                JOIN (SELECT symbol, MAX(ts) AS ts FROM snapshots GROUP BY symbol) m
+                  ON s.symbol = m.symbol AND s.ts = m.ts
+                WHERE s.composite >= ?
+                ORDER BY s.composite DESC
+                LIMIT ?
+                """,
+                (min_composite, limit),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
     # --- alert state -------------------------------------------------------
     def get_last_rating(self, chat_id: int, symbol: str) -> str | None:
         with self._lock:

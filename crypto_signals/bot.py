@@ -78,8 +78,9 @@ class CryptoSignalsBot:
                 row = []
         if row:
             kb.row(*row)
-        kb.row("📋 Watchlist", "😱 Korku Endeksi")
-        kb.row("➕ Ekle/Çıkar", "ℹ️ Yardım")
+        kb.row("📡 Radar", "📋 Watchlist")
+        kb.row("😱 Korku Endeksi", "➕ Ekle/Çıkar")
+        kb.row("ℹ️ Yardım")
         return kb
 
     # --- handlers ----------------------------------------------------------
@@ -110,11 +111,14 @@ class CryptoSignalsBot:
                 message.chat.id,
                 "*Komutlar*\n"
                 "`/sinyal <SEMBOL>` — anlık sinyal raporu (örn. `/sinyal ETH`)\n"
+                "`/radar` — son taramadaki en güçlü boğa sinyalleri\n"
                 "`/ekle <SEMBOL>` — takip listesine ekle\n"
                 "`/sil <SEMBOL>` — listeden çıkar\n"
                 "`/liste` — watchlist özeti\n"
                 "`/korku` — piyasa Korku & Açgözlülük endeksi\n"
                 "`/abonelik_iptal` — otomatik alarmları kapat\n\n"
+                "_Watchlist'in boşken otomatik tarama, hacme göre ilk "
+                f"{self.cfg.dynamic_top_n} coin'i kapsar._\n\n"
                 "_Sinyaller: Trend, Golden/Death Cross, RSI, MACD, Hacim, Kırılım, "
                 "24s Momentum, Fear & Greed._",
                 parse_mode="Markdown",
@@ -160,6 +164,26 @@ class CryptoSignalsBot:
         def _list(message):
             self._report_watchlist(message.chat.id)
 
+        @bot.message_handler(commands=["radar"])
+        def _radar(message):
+            self.repo.add_subscriber(message.chat.id)
+            rows = self.repo.latest_snapshots(limit=15, min_composite=0.30)
+            if not rows:
+                self.bot.send_message(
+                    message.chat.id,
+                    "📡 Radar henüz boş. Arka plan taraması ilk turunu (≈birkaç dk) "
+                    "tamamlayınca en güçlü boğa sinyalleri burada listelenir. "
+                    "Bu arada `/sinyal BTC` deneyebilirsin.",
+                    parse_mode="Markdown",
+                )
+                return
+            lines = [f"📡 *Radar — en güçlü {len(rows)} boğa sinyali* (son tarama):", ""]
+            for r in rows:
+                emoji = "🟢" if r["composite"] >= 0.30 else "🟡"
+                lines.append(f"{emoji} *{r['symbol']}* — {r['rating']} · skor `{r['composite']:+.2f}`")
+            lines.append("\n_Detay için: `/sinyal <SEMBOL>`. Yatırım tavsiyesi değildir._")
+            self.safe_send(message.chat.id, "\n".join(lines))
+
         @bot.message_handler(commands=["korku", "fng"])
         def _fng(message):
             fg = self.engine.sentiment.fetch()
@@ -184,6 +208,8 @@ class CryptoSignalsBot:
             text = message.text.strip()
             if text.startswith("📈 "):
                 self._report_symbol(message.chat.id, text[2:].strip())
+            elif text == "📡 Radar":
+                _radar(message)
             elif text == "📋 Watchlist":
                 self._report_watchlist(message.chat.id)
             elif text == "😱 Korku Endeksi":
@@ -246,6 +272,7 @@ class CryptoSignalsBot:
             self.bot.set_my_commands([
                 types.BotCommand("start", "Başlat ve menüyü göster"),
                 types.BotCommand("sinyal", "Bir coin için anlık sinyal"),
+                types.BotCommand("radar", "En güçlü boğa sinyalleri (son tarama)"),
                 types.BotCommand("ekle", "Takip listesine sembol ekle"),
                 types.BotCommand("sil", "Takip listesinden çıkar"),
                 types.BotCommand("liste", "Watchlist özeti"),

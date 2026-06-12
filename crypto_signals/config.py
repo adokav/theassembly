@@ -36,6 +36,12 @@ class Config:
     # --- default watchlist (used when a chat has none) ---
     default_symbols: list[str] = field(default_factory=lambda: _get_list("DEFAULT_SYMBOLS", "BTC,ETH,SOL"))
 
+    # --- dynamic universe (top-N coins by 24h quote volume) ---
+    # When > 0, subscribers without a custom watchlist are scanned against the
+    # top-N most-traded coins (refreshed every scan). 0 disables dynamic mode.
+    dynamic_top_n: int = field(default_factory=lambda: int(os.getenv("DYNAMIC_TOP_N") or "150"))
+    extra_exclude_bases: list[str] = field(default_factory=lambda: _get_list("EXCLUDE_BASES", ""))
+
     # --- scheduler ---
     scan_interval_min: int = field(default_factory=lambda: int(os.getenv("SCAN_INTERVAL_MIN") or "30"))
     alert_score_threshold: float = field(default_factory=lambda: float(os.getenv("ALERT_SCORE_THRESHOLD") or "0.35"))
@@ -60,6 +66,8 @@ class Config:
             )
         if self.scan_interval_min < 1:
             raise ConfigError("SCAN_INTERVAL_MIN en az 1 olmalı.")
+        if self.dynamic_top_n < 0:
+            raise ConfigError("DYNAMIC_TOP_N negatif olamaz (0 = devre dışı).")
         if not (0.0 < self.alert_score_threshold <= 1.0):
             raise ConfigError("ALERT_SCORE_THRESHOLD 0 ile 1 arasında olmalı.")
 

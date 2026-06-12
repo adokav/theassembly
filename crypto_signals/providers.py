@@ -44,6 +44,26 @@ class ProviderError(RuntimeError):
     pass
 
 
+# Stablecoins / fiat / wrapped quote-like bases that are tradable as <BASE>USDT
+# but are not meaningful "will it go up?" candidates — excluded from the
+# dynamic top-N universe. Extend at runtime via EXCLUDE_BASES.
+STABLE_FIAT_BASES = {
+    "USDT", "USDC", "FDUSD", "TUSD", "BUSD", "USDP", "DAI", "USD1", "AEUR",
+    "EUR", "GBP", "TRY", "BRL", "ARS", "RON", "PLN", "ZAR", "JPY", "MXN",
+    "COP", "CZK", "UAH", "NGN", "IDRT", "BIDR", "VAI", "PAXG", "WBTC",
+}
+
+
+def is_scannable_base(base: str, extra_exclude: set[str] | None = None) -> bool:
+    """Whether a base asset should appear in the dynamic universe."""
+    base = base.upper()
+    if base in STABLE_FIAT_BASES:
+        return False
+    if extra_exclude and base in extra_exclude:
+        return False
+    return True
+
+
 def _request_json(cfg: Config, url: str, params: dict | None = None):
     """GET JSON with exponential backoff. Raises ProviderError on final failure."""
     backoff = 2
@@ -107,6 +127,40 @@ class BinanceProvider:
             price_change_pct=float(data["priceChangePercent"]),
             quote_volume=float(data["quoteVolume"]),
         )
+
+    def fetch_all_tickers(self) -> list[Ticker24h]:
+        """One bulk call → 24h ticker for every <BASE>{quote_asset} pair.
+
+        Returned objects use the *base* symbol (e.g. BTC, not BTCUSDT) so the
+        rest of the package speaks one vocabulary. Reused to both pick the
+        top-N universe and feed momentum without per-symbol ticker calls.
+        """
+        data = _request_json(self.cfg, f"{self.cfg.binance_base}/api/v3/ticker/24hr")
+        if not isinstance(data, list):
+            raise ProviderError("Beklenmeyen ticker yanıtı (liste değil).")
+        quote = self.cfg.quote_asset
+        out: list[Ticker24h] = []
+        for item in data:
+            sym = item.get("symbol", "")
+            if not sym.endswith(quote) or len(sym) <= len(quote):
+                continue
+            try:
+                out.append(Ticker24h(
+                    symbol=sym[: -len(quote)],
+                    last_price=float(item["lastPrice"]),
+                    price_change_pct=float(item["priceChangePercent"]),
+                    quote_volume=float(item["quoteVolume"]),
+                ))
+            except (KeyError, ValueError, TypeError):
+                continue
+        return out
+
+    def top_symbols_by_volume(self, n: int, extra_exclude: set[str] | None = None) -> list[str]:
+        """Top-N base symbols by 24h quote volume, stables/fiat excluded."""
+        tickers = self.fetch_all_tickers()
+        scannable = [t for t in tickers if is_scannable_base(t.symbol, extra_exclude)]
+        scannable.sort(key=lambda t: t.quote_volume, reverse=True)
+        return [t.symbol for t in scannable[:n]]
 
 
 class FearGreedProvider:

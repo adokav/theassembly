@@ -14,6 +14,7 @@ from typing import Callable
 
 from .config import Config
 from .formatting import render_alert
+from .providers import is_scannable_base
 from .signals import SignalEngine, SignalReport
 from .storage import Repository
 
@@ -56,22 +57,48 @@ class SignalScheduler:
         subscribers = self.repo.list_subscribers()
         if not subscribers:
             return
-        # Map symbol -> set of interested chat_ids (dedupe API calls).
+
+        # Subscribers without a custom watchlist follow the dynamic universe.
+        watchlists = {c: self.repo.get_watchlist(c) for c in subscribers}
+        need_dynamic = any(not wl for wl in watchlists.values())
+
+        dynamic: list[str] = []
+        ticker_map: dict[str, "object"] = {}
+        if need_dynamic and self.cfg.dynamic_top_n > 0:
+            try:
+                all_tickers = self.engine.market.fetch_all_tickers()  # one bulk call
+                ticker_map = {t.symbol: t for t in all_tickers}
+                extra = set(self.cfg.extra_exclude_bases)
+                scannable = [t for t in all_tickers if is_scannable_base(t.symbol, extra)]
+                scannable.sort(key=lambda t: t.quote_volume, reverse=True)
+                dynamic = [t.symbol for t in scannable[: self.cfg.dynamic_top_n]]
+                log.info("Dinamik evren: ilk %d coin (hacme göre).", len(dynamic))
+            except Exception as e:  # noqa: BLE001 - fall back to a small static set
+                log.warning("Dinamik evren alınamadı, varsayılana düşülüyor: %s", str(e)[:160])
+                dynamic = list(self.cfg.default_symbols)
+
+        # Map symbol -> interested chat_ids (dedupe API calls across users).
         interest: dict[str, list[int]] = {}
-        for chat_id in subscribers:
-            symbols = self.repo.get_watchlist(chat_id) or self.cfg.default_symbols
+        for chat_id, wl in watchlists.items():
+            symbols = wl or dynamic or self.cfg.default_symbols
             for sym in symbols:
                 interest.setdefault(sym, []).append(chat_id)
 
         fear_greed = self.engine.sentiment.fetch()  # one market-wide fetch per tick
         for symbol, chat_ids in interest.items():
+            if self._stop.is_set():
+                return
             try:
-                rep = self.engine.evaluate(symbol, fear_greed=fear_greed)
+                rep = self.engine.evaluate(
+                    symbol, fear_greed=fear_greed, ticker=ticker_map.get(symbol)
+                )
             except Exception as e:  # noqa: BLE001 - one bad symbol shouldn't stop the scan
                 log.warning("%s değerlendirilemedi: %s", symbol, str(e)[:160])
                 continue
             self.repo.save_snapshot(symbol, rep.composite, rep.rating, _payload(rep))
             self._maybe_alert(symbol, rep, chat_ids)
+            # Gentle throttle so a 150-coin scan stays well under rate limits.
+            self._stop.wait(0.15)
 
     def _maybe_alert(self, symbol: str, rep: SignalReport, chat_ids: list[int]) -> None:
         for chat_id in chat_ids:

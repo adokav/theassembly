@@ -104,13 +104,25 @@ olasılığı %. Tek sinyal değil, **sinyallerin hemfikir olması** belirleyici
 
 ## Komutlar
 - `/sinyal BTC` — anlık sinyal raporu
+- `/radar` — son taramadaki en güçlü boğa sinyalleri (skora göre sıralı)
 - `/ekle SOL` · `/sil SOL` — takip listesi (watchlist)
 - `/liste` — watchlist özeti (skora göre sıralı)
 - `/korku` — piyasa Korku & Açgözlülük endeksi
 - `/abonelik_iptal` — otomatik alarmları kapat
 
-Periyodik tarama (`SCAN_INTERVAL_MIN`, vars. 30 dk) watchlist'i tarar; bir
-sembol **GÜÇLÜ** sinyale girince/çıkınca otomatik haber verir.
+## Hangi coinler taranır?
+- **Dinamik evren (varsayılan):** watchlist'i **boş** olan kullanıcılar için bot,
+  Binance 24s hacmine göre **ilk `DYNAMIC_TOP_N` coin'i** (vars. 150) her taramada
+  yeniden belirleyip tarar. Stablecoin/fiat çiftleri (USDC, FDUSD, EUR…) elenir;
+  `EXCLUDE_BASES` ile ek hariç tutma yapılır.
+- **Kişisel watchlist:** `/ekle`–`/sil` ile liste tanımlayan kullanıcı yalnızca
+  kendi coinlerini izler.
+- `DYNAMIC_TOP_N=0` yapılırsa dinamik mod kapanır ve `DEFAULT_SYMBOLS` kullanılır.
+
+Tek toplu ticker çağrısı hem top-N seçimi hem 24s momentum için kullanılır
+(coin başına ekstra istek yok); büyük taramada hız limiti için hafif throttle
+uygulanır. Periyodik tarama `SCAN_INTERVAL_MIN` (vars. 30 dk) ile; bir sembol
+**GÜÇLÜ** sinyale girince/çıkınca otomatik haber verir.
 
 ## Çalıştırma
 ```bash

@@ -198,12 +198,18 @@ class SignalEngine:
         self.market = BinanceProvider(cfg)
         self.sentiment = FearGreedProvider(cfg)
 
-    def evaluate(self, symbol: str, fear_greed: tuple[int, str] | None = None) -> SignalReport:
+    def evaluate(
+        self,
+        symbol: str,
+        fear_greed: tuple[int, str] | None = None,
+        ticker: Ticker24h | None = None,
+    ) -> SignalReport:
         ohlcv: OHLCV = self.market.fetch_ohlcv(symbol)
-        try:
-            ticker = self.market.fetch_ticker24h(symbol)
-        except Exception:  # noqa: BLE001 - 24h ticker is a nice-to-have
-            ticker = None
+        if ticker is None:
+            try:
+                ticker = self.market.fetch_ticker24h(symbol)
+            except Exception:  # noqa: BLE001 - 24h ticker is a nice-to-have
+                ticker = None
         if fear_greed is None:
             fear_greed = self.sentiment.fetch()
 
