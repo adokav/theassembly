@@ -31,7 +31,7 @@ logging.basicConfig(
 log = logging.getLogger("assembly-bot")
 
 # Bump when shipping notable changes so /diag confirms which build is live.
-BUILD_TAG = "2026-06-17 whale+macro"
+BUILD_TAG = "2026-06-17 whale+macro+2pass"
 
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 
@@ -699,9 +699,47 @@ def merge_by_ticker(per_account):
     return items
 
 
-def build_combined_report(items, period_text, counts):
-    """Pass 2 (combined): a Wall-Street-analyst-style report across both accounts.
-    Consensus picks lead, then disagreements, then single-source ideas."""
+def analyst_reasoning(items, period_text):
+    """Stage 1 of the two-pass write: THINK before writing. Produces rigorous,
+    per-ticker analyst notes (technical read, risk/reward with levels, what
+    invalidates the thesis, catalyst, decision) that Stage 2 expands into the
+    report. Lower temperature for discipline; grounded strictly in the numbers."""
+    payload = json.dumps(items, ensure_ascii=False, default=str)
+    system = (
+        "Sen kıdemli, şüpheci bir buy-side analistsin. Yüzeysel değil, KENDİ bir "
+        "muhakeme yaparsın: her iddiayı sayılarla sınarsın. Türkçe düşünürsün. "
+        "SADECE verilen sayıları kullan; fiyat/teknik/tarih UYDURMA. Tezi tekrar "
+        "etmek YETMEZ — yeni içgörü kat (zayıflık, çelişki, risk)."
+    )
+    user = f"""Aşağıda {period_text} için hisse önerileri, kaynak etiketleri, güncel
+piyasa verisi ve haberler (JSON) var:
+
+{payload}
+
+Her ticker için KISA ama DERİN bir analist notu üret. Şu maddeleri doldur (veri
+yoksa "veri yok" yaz, uydurma):
+
+### <TICKER>
+- Teknik kurulum: fiyatın 50G ve 200G'ye göre konumu ve ne anlama geldiği (ör. "fiyat 50G'nin ALTINDA → kısa vade zayıf"), RSI momentum yorumu, 52H aralığındaki yeri.
+- Risk/Ödül: mantıklı giriş bölgesi, stop (≈ giriş − 1.5×ATR; ATR yoksa son teknik destek), hedef ve yaklaşık R (ödül/risk). Sayıları veriden türet, mantığı yaz.
+- Katalizör & haber etkisi: (varsa) haber kararı nasıl etkiliyor.
+- Tezi NE BOZAR: fikri geçersiz kılacak somut seviye/durum.
+- Karar: <GÜÇLÜ AL / AL / TUT / İZLE / SAT> — tek cümle NET gerekçe (muğlak "verilebilir/olabilir" YOK).
+
+Kurallar:
+- Kanaat = kaynak sayısı + teknik destek + risk/ödül. Konsensüs (iki kaynak aynı yön) kanaati güçlendirir; ayrışmada hangi taraf teknik/haberle daha sağlam AÇIKÇA söyle.
+- Orijinal niyet "izle" ise karar İZLE olabilir; AL/SAT'a zorlama.
+- Yalnızca analist notlarını döndür; nihai raporu YAZMA."""
+    return _llm_chat(
+        [{"role": "system", "content": system}, {"role": "user", "content": user}],
+        max_tokens=1800, temperature=0.25,
+    )
+
+
+def build_combined_report(items, period_text, counts, reasoning=""):
+    """Pass 2 (combined): Wall-Street-analyst-style report. Stage 2 of the two-pass
+    write — expands the Stage-1 analyst notes (`reasoning`) into the formatted
+    report. Consensus picks lead, then disagreements, then single-source ideas."""
     accounts_meta = [
         {"name": a["name"], "badge": ACCOUNT_BADGES[k], "post_count": counts.get(k, 0)}
         for k, a in ACCOUNTS.items()
@@ -714,21 +752,28 @@ def build_combined_report(items, period_text, counts):
         "singles": [i for i in items if i["kind"] == "single"],
     }, ensure_ascii=False, default=str)
 
+    reasoning_block = (
+        "\n🧠 STAGE-1 ANALİST NOTLARI (bu muhakemeyi ESAS AL ve kartlara dök; "
+        f"yeni sayı türetme, tezi tekrar etme — bu içgörüyü kullan):\n{reasoning}\n"
+        if (reasoning or "").strip() else ""
+    )
+
     system = (
         "Sen deneyimli bir Wall Street sell-side analistisin. Türkçe, net, ölçülü "
         "yazarsın. Takip edilen X hesaplarının önerilerini bağımsız bir analist "
         "gözüyle değerlendirirsin: kanaat, teknik kurulum, risk/ödül ve katalizör. "
         "SADECE sana verilen sayıları kullan; fiyat/teknik/tarih UYDURMA. market "
-        "alanı null ise o varlık için fiyat/teknik yorumu yapma."
+        "alanı null ise o varlık için fiyat/teknik yorumu yapma. Verilen STAGE-1 "
+        "analist notlarını sadık biçimde rapora dök; muğlak/dolgu cümle kurma."
     )
     user = f"""Aşağıda takip edilen X hesaplarının {period_text} içindeki hisse önerileri,
 kaynak etiketleriyle ve güncel piyasa verisiyle (JSON) birlikte verildi:
 
 {payload}
-
+{reasoning_block}
 Telegram'da okunacak, MOBİL DOSTU, taranabilir TEK bir rapor yaz. Rozetleri aynen
 kullan (her hesabın badge'i payload'da). Her öneriyi bir analist gibi değerlendir ve
-şu KARAR ölçeğinden birini ver: *GÜÇLÜ AL* / *AL* / *TUT* / *SAT*.
+şu KARAR ölçeğinden birini ver: *GÜÇLÜ AL* / *AL* / *TUT* / *İZLE* / *SAT*.
 
 TAM olarak şu yapıda yaz:
 
@@ -756,8 +801,9 @@ Her KART formatı:
 📊 _Teknik:_ RSI <rsi> · 50G <ma50> · 200G <ma200> · 52H <low52>–<high52> · hacim <vol_trend>
 📰 _Haber:_ <news listesindeki en önemli 1 başlığı Türkçe, kısa özetle + (tarih). news boşsa bu satırı YAZMA.>
 💬 _Tez:_ <kaynakların tezini 1 cümlede sentezle>
-🧠 _Analist görüşü:_ <1-2 cümle: kurulum + risk/ödül; konsensüste "iki bağımsız kaynağın da aynı yönde olması kanaati güçlendiriyor" vurgusu; ayrışmada hangisi daha sağlam. Varsa haberin karara etkisini de belirt.>
-🎯 _Karar:_ *<GÜÇLÜ AL / AL / TUT / SAT>* — <tek cümle gerekçe>
+🧠 _Analist görüşü:_ <STAGE-1 notundan: teknik kurulum (fiyatın 50G/200G'ye konumu) + risk/ödül; konsensüste iki bağımsız kaynağın aynı yönde olması kanaati güçlendirir, ayrışmada hangisi daha sağlam. Varsa haberin etkisi. Tezi TEKRAR ETME, içgörü kat. Dolgu YOK.>
+🛑 _Tezi bozan:_ <fikri geçersiz kılacak somut seviye/durum (STAGE-1'den)>
+🎯 _Karar:_ *<GÜÇLÜ AL / AL / TUT / İZLE / SAT>* — <tek cümle NET gerekçe (muğlak ifade yok)>
 
 Kurallar:
 - Karar ölçeği: konsensüs + teknik destek + makul RSI → GÜÇLÜ AL eğilimi. Tek kaynak ama
@@ -765,6 +811,11 @@ Kurallar:
   aşağı, endeks gerisinde belirgin → SAT.
 - RSI>70 aşırı alım (GÜÇLÜ AL verme); fiyat 200G altındaysa trend zayıf; alpha negatifse
   "endeksin gerisinde", pozitifse "endeksi yendi" de.
+- Orijinal niyet "izle" ise karar İZLE olabilir; AL/SAT'a zorlama.
+- pct_change ~0 ya da dönem çok kısaysa (ör. Son 1 Gün): değişim vurgusu yapma, sadece
+  güncel fiyatı ver ve "kısa dönem — anlamlı değişim yok" de.
+- DOLGU YASAK: "verilebilir/olabilir" gibi muğlak bitişler ve tezi tekrar eden gerekçe
+  kullanma; her görüş ölçülebilir bir dayanağa (teknik/risk-ödül/haber) otursun.
 - Sektör (sector) null ise 🏷️ satırını yazma. Sektör İngilizce geldiyse (ör.
   "Medical Devices", "Semiconductors") Türkçeye çevirerek yaz ("Medikal Cihazlar",
   "Yarı İletkenler"); anlamı KORU, kategoriyi değiştirme.
@@ -947,9 +998,15 @@ def analyze_combined(days, period_text, notify=None):
     step("📰 Güncel haberler taranıyor...")
     enrich_news(items)
 
-    # 5) Build the analyst report, then self-critique it.
-    step("📝 Wall Street analisti raporu yazıyor...")
-    report = build_combined_report(items, period_text, counts)
+    # 5) Two-stage write: reason first (Stage 1), then format (Stage 2).
+    step("🧠 Analist muhakemesi yapılıyor (1/2)...")
+    try:
+        reasoning = analyst_reasoning(items, period_text)
+    except Exception as e:  # noqa: BLE001 - reasoning is additive; fall back to direct write
+        log.warning("Stage-1 muhakeme atlandı: %s", str(e)[:160])
+        reasoning = ""
+    step("📝 Wall Street analisti raporu yazıyor (2/2)...")
+    report = build_combined_report(items, period_text, counts, reasoning)
     step("🔍 Rapor doğrulanıyor (son kontrol)...")
     report = verify_report(report, items)
 
