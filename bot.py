@@ -31,7 +31,7 @@ logging.basicConfig(
 log = logging.getLogger("assembly-bot")
 
 # Bump when shipping notable changes so /diag confirms which build is live.
-BUILD_TAG = "2026-06-10 sector-real"
+BUILD_TAG = "2026-06-17 whale+macro"
 
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 
