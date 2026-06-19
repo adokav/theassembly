@@ -31,7 +31,7 @@ logging.basicConfig(
 log = logging.getLogger("assembly-bot")
 
 # Bump when shipping notable changes so /diag confirms which build is live.
-BUILD_TAG = "2026-06-17 whale+macro+2pass"
+BUILD_TAG = "2026-06-17 fundamentals+news-sentiment"
 
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 
@@ -492,11 +492,13 @@ def enrich_recommendations(recs):
     tickers.add("SPY")  # benchmark
     quotes = {}
     sectors = {}
+    funds = {}
     if tickers:
         stock_tickers = [tk for tk in tickers if tk != "SPY"]
-        with ThreadPoolExecutor(max_workers=min(10, len(tickers) + len(stock_tickers))) as ex:
+        with ThreadPoolExecutor(max_workers=min(12, len(tickers) + 2 * len(stock_tickers))) as ex:
             qf = {ex.submit(fetch_quote, tk): tk for tk in tickers}
             sf = {ex.submit(fetch_sector, tk): tk for tk in stock_tickers}
+            df = {ex.submit(fetch_fundamentals, tk): tk for tk in stock_tickers}
             for fut in qf:
                 try:
                     quotes[qf[fut]] = fut.result()
@@ -507,12 +509,18 @@ def enrich_recommendations(recs):
                     sectors[sf[fut]] = fut.result()
                 except Exception:  # noqa: BLE001
                     sectors[sf[fut]] = None
+            for fut in df:
+                try:
+                    funds[df[fut]] = fut.result()
+                except Exception:  # noqa: BLE001
+                    funds[df[fut]] = None
     bench = quotes.get("SPY")
     for r in targets:
         tk = (r.get("ticker") or "").strip().upper()
         # Prefer the real sector from Yahoo; fall back to the LLM's guess.
         if tk and sectors.get(tk):
             r["sector"] = sectors[tk]
+        r["fundamentals"] = funds.get(tk)
         if not tk:
             r["market"] = None
             continue
@@ -550,6 +558,10 @@ def enrich_recommendations(recs):
             "alpha_vs_sp500": _r(alpha, 1),
             "currency": q.get("currency"),
         }
+        # Analyst upside vs the current price (precomputed so the model can't mis-math).
+        fund = r.get("fundamentals")
+        if fund and fund.get("target_mean") and cur:
+            fund["target_upside_pct"] = _r((fund["target_mean"] - cur) / cur * 100, 1)
     return recs
 
 
@@ -580,6 +592,119 @@ def fetch_sector(ticker):
             or match.get("sectorDisp") or match.get("sector") or None)
 
 
+_YAHOO_AUTH = {"session": None, "crumb": None}
+
+
+def _yahoo_auth():
+    """Lazily establish a Yahoo session + crumb for the quoteSummary endpoint,
+    which (unlike the chart endpoint) requires authentication. Cached for the
+    process; returns (session, crumb) or (None, None) on failure."""
+    if _YAHOO_AUTH["session"] is not None and _YAHOO_AUTH["crumb"]:
+        return _YAHOO_AUTH["session"], _YAHOO_AUTH["crumb"]
+    try:
+        s = requests.Session()
+        s.headers.update({"User-Agent": USER_AGENT})
+        s.get("https://fc.yahoo.com", timeout=HTTP_TIMEOUT)
+        r = s.get("https://query1.finance.yahoo.com/v1/test/getcrumb",
+                  timeout=HTTP_TIMEOUT)
+        crumb = (r.text or "").strip()
+        if crumb and "<" not in crumb and len(crumb) < 40:
+            _YAHOO_AUTH["session"], _YAHOO_AUTH["crumb"] = s, crumb
+            return s, crumb
+    except Exception as e:  # noqa: BLE001
+        log.warning("Yahoo crumb alınamadı: %s", str(e)[:120])
+    return None, None
+
+
+def _human_cap(v):
+    """Compact market-cap label (T=trilyon, Mr=milyar, Mn=milyon)."""
+    if not isinstance(v, (int, float)) or v <= 0:
+        return None
+    for unit, div in (("T", 1e12), ("Mr", 1e9), ("Mn", 1e6)):
+        if v >= div:
+            return f"{v / div:.1f}{unit}"
+    return str(int(v))
+
+
+def fetch_fundamentals(ticker):
+    """Valuation, profitability, next earnings date and analyst price target via
+    Yahoo's quoteSummary endpoint. Best-effort: returns None on any failure, in
+    which case the report simply omits these lines (like missing market data)."""
+    s, crumb = _yahoo_auth()
+    if not s:
+        return None
+
+    def num(x, d=2):
+        return round(x, d) if isinstance(x, (int, float)) else None
+
+    def pct(x):
+        return round(x * 100, 1) if isinstance(x, (int, float)) else None
+
+    def raw(d, k):
+        v = (d or {}).get(k)
+        if isinstance(v, dict):
+            return v.get("raw")
+        return v if isinstance(v, (int, float)) else None
+
+    try:
+        url = f"https://query1.finance.yahoo.com/v10/finance/quoteSummary/{ticker}"
+        modules = "summaryDetail,defaultKeyStatistics,financialData,calendarEvents"
+        resp = s.get(url, params={"modules": modules, "crumb": crumb},
+                     timeout=HTTP_TIMEOUT)
+        resp.raise_for_status()
+        res = resp.json()["quoteSummary"]["result"][0]
+    except Exception as e:  # noqa: BLE001
+        log.warning("Temel veri alınamadı (%s): %s", ticker, str(e)[:120])
+        return None
+
+    sd, ks = res.get("summaryDetail") or {}, res.get("defaultKeyStatistics") or {}
+    fd, ce = res.get("financialData") or {}, res.get("calendarEvents") or {}
+
+    earnings_date = None
+    edates = ((ce.get("earnings") or {}).get("earningsDate")) or []
+    ts_list = sorted(e["raw"] for e in edates if isinstance(e, dict) and e.get("raw"))
+    if ts_list:
+        now = datetime.now().timestamp()
+        upcoming = [t for t in ts_list if t >= now]
+        chosen = upcoming[0] if upcoming else ts_list[-1]
+        earnings_date = datetime.fromtimestamp(chosen).strftime("%d.%m.%Y")
+
+    out = {
+        "pe": num(raw(sd, "trailingPE")),
+        "forward_pe": num(raw(sd, "forwardPE") or raw(ks, "forwardPE")),
+        "ps": num(raw(sd, "priceToSalesTrailing12Months")),
+        "market_cap": _human_cap(raw(sd, "marketCap") or raw(ks, "marketCap")),
+        "profit_margin": pct(raw(fd, "profitMargins") or raw(ks, "profitMargins")),
+        "revenue_growth": pct(raw(fd, "revenueGrowth")),
+        "target_mean": num(raw(fd, "targetMeanPrice")),
+        "num_analysts": raw(fd, "numberOfAnalystOpinions"),
+        "recommendation": fd.get("recommendationKey") or None,
+        "earnings_date": earnings_date,
+    }
+    return out if any(v is not None for v in out.values()) else None
+
+
+_BULL = ("beat", "beats", "surge", "soar", "jump", "jumps", "rally", "record",
+         "upgrade", "upgrades", "raises", "raise", "boost", "wins", "gains",
+         "rises", "outperform", "bullish", "tops", "strong", "growth", "approval")
+_BEAR = ("miss", "misses", "plunge", "plummet", "slump", "falls", "drop", "drops",
+         "downgrade", "downgrades", "cut", "cuts", "lawsuit", "probe", "warns",
+         "investigation", "warning", "weak", "loss", "sinks", "tumble", "bearish",
+         "halt", "recall", "delay", "slashes")
+
+
+def _news_sentiment(title):
+    """Cheap rule-based headline sentiment: 'olumlu' / 'olumsuz' / 'nötr'."""
+    t = (title or "").lower()
+    pos = sum(w in t for w in _BULL)
+    neg = sum(w in t for w in _BEAR)
+    if pos > neg:
+        return "olumlu"
+    if neg > pos:
+        return "olumsuz"
+    return "nötr"
+
+
 def fetch_news(asset, ticker):
     """Best-effort: most recent headlines for a stock via Google News RSS.
     Single quick attempt; returns a short list of {title, date} or [] on any
@@ -596,7 +721,7 @@ def fetch_news(asset, ticker):
         log.warning("Haber alınamadı (%s): %s", ticker, str(e)[:120])
         return []
     cutoff = datetime.utcnow() - timedelta(days=NEWS_LOOKBACK_DAYS)
-    out = []
+    out, seen = [], set()
     for entry in parsed.entries:
         pub = entry.get("published_parsed") or entry.get("updated_parsed")
         when = datetime.utcfromtimestamp(calendar.timegm(pub)) if pub else None
@@ -605,9 +730,20 @@ def fetch_news(asset, ticker):
         title = (entry.get("title") or "").strip()
         if not title:
             continue
-        # Google News appends " - Source"; keep it, it's useful provenance.
-        out.append({"title": title[:160],
-                    "date": (when + TR_OFFSET).strftime("%d.%m.%Y") if when else ""})
+        # Google News appends " - Source"; split it off as provenance.
+        source = ""
+        if " - " in title:
+            title, source = (p.strip() for p in title.rsplit(" - ", 1))
+        key = title.lower()[:70]
+        if not title or key in seen:  # drop near-duplicate headlines
+            continue
+        seen.add(key)
+        out.append({
+            "title": title[:160],
+            "source": source[:40],
+            "sentiment": _news_sentiment(title),
+            "date": (when + TR_OFFSET).strftime("%d.%m.%Y") if when else "",
+        })
         if len(out) >= NEWS_MAX_ITEMS:
             break
     return out
@@ -722,7 +858,8 @@ yoksa "veri yok" yaz, uydurma):
 ### <TICKER>
 - Teknik kurulum: fiyatın 50G ve 200G'ye göre konumu ve ne anlama geldiği (ör. "fiyat 50G'nin ALTINDA → kısa vade zayıf"), RSI momentum yorumu, 52H aralığındaki yeri.
 - Risk/Ödül: mantıklı giriş bölgesi, stop (≈ giriş − 1.5×ATR; ATR yoksa son teknik destek), hedef ve yaklaşık R (ödül/risk). Sayıları veriden türet, mantığı yaz.
-- Katalizör & haber etkisi: (varsa) haber kararı nasıl etkiliyor.
+- Değerleme: fundamentals'tan F/K, ileri F/K, F/S, gelir büyümesi, marj ile "pahalı / makul / ucuz" yargısını GEREKÇELENDİR. Analist ortalama hedefi (target_mean) ve target_upside_pct'i tart (örn. "%X yukarı potansiyel, n analist").
+- Katalizör & haber: yaklaşan kazanç tarihi (earnings_date) ~2 hafta içindeyse RİSK olarak işaretle. Haberlerin genel duygu dengesini (olumlu/olumsuz başlık sayısı) değerlendir — tek başlığa değil dengeye bak.
 - Tezi NE BOZAR: fikri geçersiz kılacak somut seviye/durum.
 - Karar: <GÜÇLÜ AL / AL / TUT / İZLE / SAT> — tek cümle NET gerekçe (muğlak "verilebilir/olabilir" YOK).
 
@@ -799,7 +936,10 @@ Her KART formatı:
 👥 _Kaynak:_ <her kaynak için "badge Hesap Adı: AKSİYON"; ortak ise "Her iki hesap da: AKSİYON">
 📈 _Fiyat:_ ~<entry_then> → *<current> <currency>* (<pct_change>%); S&P'ye karşı <alpha_vs_sp500> puan
 📊 _Teknik:_ RSI <rsi> · 50G <ma50> · 200G <ma200> · 52H <low52>–<high52> · hacim <vol_trend>
-📰 _Haber:_ <news listesindeki en önemli 1 başlığı Türkçe, kısa özetle + (tarih). news boşsa bu satırı YAZMA.>
+💵 _Temeller:_ F/K <pe> · ileri F/K <forward_pe> · F/S <ps> · Mcap <market_cap> · marj %<profit_margin> · gelir %<revenue_growth>  (fundamentals'tan; null metriği atla, hepsi null ise satırı YAZMA)
+🎯 _Analist hedefi:_ ~<target_mean> <currency> (%<target_upside_pct> potansiyel) · <num_analysts> analist · <recommendation>  (target_mean null ise satırı YAZMA)
+📅 _Kazanç:_ <earnings_date>  (earnings_date null ise YAZMA; tarih ~2 hafta içindeyse Analist görüşünde RİSK olarak belirt)
+📰 _Haber:_ <en güncel/önemli 1-2 başlığı Türkçe kısa özetle + (kaynak, tarih) [olumlu/olumsuz/nötr]. news boşsa bu satırı YAZMA.>
 💬 _Tez:_ <kaynakların tezini 1 cümlede sentezle>
 🧠 _Analist görüşü:_ <STAGE-1 notundan: teknik kurulum (fiyatın 50G/200G'ye konumu) + risk/ödül; konsensüste iki bağımsız kaynağın aynı yönde olması kanaati güçlendirir, ayrışmada hangisi daha sağlam. Varsa haberin etkisi. Tezi TEKRAR ETME, içgörü kat. Dolgu YOK.>
 🛑 _Tezi bozan:_ <fikri geçersiz kılacak somut seviye/durum (STAGE-1'den)>
@@ -820,7 +960,11 @@ Kurallar:
   "Medical Devices", "Semiconductors") Türkçeye çevirerek yaz ("Medikal Cihazlar",
   "Yarı İletkenler"); anlamı KORU, kategoriyi değiştirme.
 - 📰 Haber satırı: SADECE verilen news başlıklarını kullan, haber UYDURMA. Başlık İngilizce
-  ise anlamını Türkçe ver. En güncel/önemli 1 başlık yeterli.
+  ise anlamını Türkçe ver. En güncel/önemli 1-2 başlık; her başlığın sentiment etiketini
+  ([olumlu]/[olumsuz]/[nötr]) göster ve haberlerin genel dengesini Analist görüşüne yansıt.
+- 💵 Temeller / 🎯 Analist hedefi / 📅 Kazanç: SADECE fundamentals'taki değerleri kullan;
+  null olanı yazma, sayı UYDURMA. target_upside_pct verildiği gibi kullan, yeniden hesaplama.
+  fundamentals tamamen yoksa bu üç satırı atla.
 - Bir değer null ise o metriği yazma; market null ise kartta sadece
   "ℹ️ Fiyat verisi alınamadı" yaz ve kararı tez/kanaat üzerinden ver.
 - UYDURMA: yalnızca verilen sayıları kullan, yeni fiyat türetme.
@@ -838,7 +982,8 @@ def verify_report(report, recs):
     facts = json.dumps(
         [{"ticker": r.get("ticker"), "asset": r.get("asset"),
           "date": r.get("date"), "sector": r.get("sector"),
-          "news": r.get("news"), "market": r.get("market")} for r in recs],
+          "news": r.get("news"), "market": r.get("market"),
+          "fundamentals": r.get("fundamentals")} for r in recs],
         ensure_ascii=False,
     )
     system = ("Sen titiz bir finansal düzeltmensin. Görevin: rapordaki HER sayı ve "
@@ -854,6 +999,8 @@ DENETLENECEK RAPOR:
 
 Kurallar:
 - Fiyat/yüzde/RSI/ortalama/52H/alpha gibi değerler GERÇEK VERİ ile birebir uyuşmalı.
+- F/K, ileri F/K, F/S, marj, gelir, piyasa değeri, analist hedefi/upside ve kazanç tarihi
+  de GERÇEK VERİ (fundamentals) ile uyuşmalı; veride olmayanı çıkar.
 - Stop/Hedef/R hesapları mantıklı kalsın (giriş/atr'den türetilmiş); uydurma fiyat ekleme.
 - Veride olmayan bir varlık/sayı varsa çıkar.
 - Düzeltme gerekmiyorsa raporu aynen geri ver.
