@@ -31,7 +31,7 @@ logging.basicConfig(
 log = logging.getLogger("assembly-bot")
 
 # Bump when shipping notable changes so /diag confirms which build is live.
-BUILD_TAG = "2026-06-12 4accounts"
+BUILD_TAG = "2026-06-21 cleaner-cards"
 
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 
@@ -749,18 +749,21 @@ TAM olarak şu yapıda yaz:
 <3-4 cümle sentez: konsensüs fikirler neden öne çıkıyor, hangi ayrışmada kim daha
 ikna edici, dönemin net çıkarımı ve pratik aksiyon.>
 
-Her KART formatı:
-*<badge(ler)> <ticker> · <asset>*
+Her KART formatı (RENK YOK — karar METİN ROZETİ ile gösterilir; renkli kareler
+yalnızca hesabı belirtir):
+*【<GÜÇLÜ AL / AL / TUT / SAT>】 <ticker> · <asset>*
 🏷️ _Sektör:_ <sector>
-👥 _Kaynak:_ <her kaynak için "badge Hesap Adı: AKSİYON"; tüm hesaplar aynı fikirdeyse "Tüm hesaplar: AKSİYON">
-📈 _Fiyat:_ ~<entry_then> → *<current> <currency>* (<pct_change>%); S&P'ye karşı <alpha_vs_sp500> puan
+👥 _Öneren:_ <her kaynak için "badge Hesap Adı → '<o hesabın aksiyonu: AL/SAT/İZLE>'"; birden çok hesabı " · " ile ayır; hepsi aynı aksiyonsa "badge'ler → hepsi '<AKSİYON>'">
+💵 _Fiyat:_ ~<entry_then> → *<current> <currency>* (%<pct_change>); S&P'ye karşı <alpha_vs_sp500> puan
 📊 _Teknik:_ RSI <rsi> · 50G <ma50> · 200G <ma200> · 52H <low52>–<high52> · hacim <vol_trend>
 📰 _Haber:_ <news listesindeki en önemli 1 başlığı Türkçe, kısa özetle + (tarih). news boşsa bu satırı YAZMA.>
-💬 _Tez:_ <kaynakların tezini 1 cümlede sentezle>
-🧠 _Analist görüşü:_ <1-2 cümle: kurulum + risk/ödül; konsensüste "iki bağımsız kaynağın da aynı yönde olması kanaati güçlendiriyor" vurgusu; ayrışmada hangisi daha sağlam. Varsa haberin karara etkisini de belirt.>
-🎯 _Karar:_ *<GÜÇLÜ AL / AL / TUT / SAT>* — <tek cümle gerekçe>
+🧠 _Analist:_ <1-2 cümle: kaynakların tezinin özü + teknik kurulum + risk/ödül; konsensüste "birden çok bağımsız kaynağın aynı yönde olması kanaati güçlendiriyor" vurgusu; varsa haberin karara etkisi.>
+⚠️ _Görüş farkı:_ <SADECE hesabın önerisi ile senin kararın YÖNÜ farklıysa yaz, ör. "Whale 'AL' önerdi; analist TUT diyor — uzun vade trend zayıf." Aksi halde bu satırı YAZMA.>
 
 Kurallar:
+- Başlıktaki karar rozetini 【 】 içinde, kalın yaz. Renk dairesi (🟢🟡🔴) KULLANMA.
+- Aksiyon→karar yönü eşlemesi: hesabın "AL"ına karşı senin kararın TUT/SAT ise bu bir
+  "görüş farkı"dır; "İZLE"ye karşı AL/SAT da farktır. Aynı yöndeyse ⚠️ satırını yazma.
 - Karar ölçeği: konsensüs + teknik destek + makul RSI → GÜÇLÜ AL eğilimi. Tek kaynak ama
   sağlam kurulum → AL. Fiyat çok kaçmış / RSI>75 / 52H zirvede → TUT. Tez bozulmuş, trend
   aşağı, endeks gerisinde belirgin → SAT.
