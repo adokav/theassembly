@@ -31,7 +31,7 @@ logging.basicConfig(
 log = logging.getLogger("assembly-bot")
 
 # Bump when shipping notable changes so /diag confirms which build is live.
-BUILD_TAG = "2026-06-21 cleaner-cards"
+BUILD_TAG = "2026-06-21 add-globalmkt"
 
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 
@@ -91,6 +91,7 @@ _ACCOUNT_DEFS = [
     ("whale", "Whale Receipts", "WhaleReceipts", "WHALE_RSS_URL",
      "https://rss.app/feeds/y1A7Zf5WQbQL24xm.xml"),
     ("rzayev", "Rzayev", "rzayev7895", "RZAYEV_RSS_URL", ""),
+    ("globalmkt", "Global Markets", "globalmktobserv", "GLOBALMKT_RSS_URL", ""),
 ]
 
 
