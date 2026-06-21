@@ -31,7 +31,7 @@ logging.basicConfig(
 log = logging.getLogger("assembly-bot")
 
 # Bump when shipping notable changes so /diag confirms which build is live.
-BUILD_TAG = "2026-06-10 sector-real"
+BUILD_TAG = "2026-06-12 add-rzayev"
 
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 
@@ -88,6 +88,7 @@ _ACCOUNT_DEFS = [
     ("assembly", "The Assembly", "InTheAssembly", "RSS_URL", ""),
     ("bora", "Bora Özkent", "BoraOzkent", "BORA_RSS_URL",
      "https://rss.app/feeds/XVMR34JsDkbWXBYl.xml"),
+    ("rzayev", "Rzayev", "rzayev7895", "RZAYEV_RSS_URL", ""),
 ]
 
 
@@ -719,8 +720,8 @@ def build_combined_report(items, period_text, counts):
         "SADECE sana verilen sayıları kullan; fiyat/teknik/tarih UYDURMA. market "
         "alanı null ise o varlık için fiyat/teknik yorumu yapma."
     )
-    user = f"""Aşağıda iki X hesabının {period_text} içindeki hisse önerileri, kaynak
-etiketleriyle ve güncel piyasa verisiyle (JSON) birlikte verildi:
+    user = f"""Aşağıda takip edilen {len(ACCOUNTS)} X hesabının {period_text} içindeki hisse
+önerileri, kaynak etiketleriyle ve güncel piyasa verisiyle (JSON) birlikte verildi:
 
 {payload}
 
@@ -734,7 +735,7 @@ TAM olarak şu yapıda yaz:
 <2-3 cümle: dönemin genel tonu, en yüksek kanaatli fikir, dikkat çeken risk>
 
 ━━━ 🤝 *ORTAK GÖRÜŞLER (KONSENSÜS)* ━━━
-(consensus listesi; her biri için KART. Liste boşsa bu bölümü "• Bu dönemde iki hesabın ortak önerisi yok." yaz.)
+(consensus listesi; birden fazla hesabın aynı yönde önerdiği hisseler; her biri için KART. Liste boşsa bu bölümü "• Bu dönemde hesapların ortak önerisi yok." yaz.)
 
 ━━━ ⚖️ *GÖRÜŞ AYRILIĞI* ━━━
 (divergence listesi; aynı hisseye zıt görüş. Boşsa bu başlığı tamamen atla.)
@@ -749,7 +750,7 @@ ikna edici, dönemin net çıkarımı ve pratik aksiyon.>
 Her KART formatı:
 *<badge(ler)> <ticker> · <asset>*
 🏷️ _Sektör:_ <sector>
-👥 _Kaynak:_ <her kaynak için "badge Hesap Adı: AKSİYON"; ortak ise "Her iki hesap da: AKSİYON">
+👥 _Kaynak:_ <her kaynak için "badge Hesap Adı: AKSİYON"; tüm hesaplar aynı fikirdeyse "Tüm hesaplar: AKSİYON">
 📈 _Fiyat:_ ~<entry_then> → *<current> <currency>* (<pct_change>%); S&P'ye karşı <alpha_vs_sp500> puan
 📊 _Teknik:_ RSI <rsi> · 50G <ma50> · 200G <ma200> · 52H <low52>–<high52> · hacim <vol_trend>
 📰 _Haber:_ <news listesindeki en önemli 1 başlığı Türkçe, kısa özetle + (tarih). news boşsa bu satırı YAZMA.>
@@ -849,7 +850,7 @@ def analyze_combined(days, period_text, notify=None):
                 pass
 
     # 1) Fetch every account's posts in parallel.
-    step("📥 Paylaşımlar çekiliyor (2 hesap)...")
+    step(f"📥 Paylaşımlar çekiliyor ({len(ACCOUNTS)} hesap)...")
     fetched = {}
     with ThreadPoolExecutor(max_workers=max(1, len(ACCOUNTS))) as ex:
         futs = {ex.submit(get_recent_posts, days, a["feeds"]): key
