@@ -31,7 +31,7 @@ logging.basicConfig(
 log = logging.getLogger("assembly-bot")
 
 # Bump when shipping notable changes so /diag confirms which build is live.
-BUILD_TAG = "2026-06-10 sector-real"
+BUILD_TAG = "2026-06-12 4accounts"
 
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 
@@ -90,6 +90,7 @@ _ACCOUNT_DEFS = [
      "https://rss.app/feeds/XVMR34JsDkbWXBYl.xml"),
     ("whale", "Whale Receipts", "WhaleReceipts", "WHALE_RSS_URL",
      "https://rss.app/feeds/y1A7Zf5WQbQL24xm.xml"),
+    ("rzayev", "Rzayev", "rzayev7895", "RZAYEV_RSS_URL", ""),
 ]
 
 
@@ -721,8 +722,8 @@ def build_combined_report(items, period_text, counts):
         "SADECE sana verilen sayıları kullan; fiyat/teknik/tarih UYDURMA. market "
         "alanı null ise o varlık için fiyat/teknik yorumu yapma."
     )
-    user = f"""Aşağıda takip edilen X hesaplarının {period_text} içindeki hisse önerileri,
-kaynak etiketleriyle ve güncel piyasa verisiyle (JSON) birlikte verildi:
+    user = f"""Aşağıda takip edilen {len(ACCOUNTS)} X hesabının {period_text} içindeki hisse
+önerileri, kaynak etiketleriyle ve güncel piyasa verisiyle (JSON) birlikte verildi:
 
 {payload}
 
@@ -736,7 +737,7 @@ TAM olarak şu yapıda yaz:
 <2-3 cümle: dönemin genel tonu, en yüksek kanaatli fikir, dikkat çeken risk>
 
 ━━━ 🤝 *ORTAK GÖRÜŞLER (KONSENSÜS)* ━━━
-(consensus listesi; her biri için KART. Liste boşsa bu bölümü "• Bu dönemde hesapların ortak önerisi yok." yaz.)
+(consensus listesi; birden fazla hesabın aynı yönde önerdiği hisseler; her biri için KART. Liste boşsa bu bölümü "• Bu dönemde hesapların ortak önerisi yok." yaz.)
 
 ━━━ ⚖️ *GÖRÜŞ AYRILIĞI* ━━━
 (divergence listesi; aynı hisseye zıt görüş. Boşsa bu başlığı tamamen atla.)
@@ -751,7 +752,7 @@ ikna edici, dönemin net çıkarımı ve pratik aksiyon.>
 Her KART formatı:
 *<badge(ler)> <ticker> · <asset>*
 🏷️ _Sektör:_ <sector>
-👥 _Kaynak:_ <her kaynak için "badge Hesap Adı: AKSİYON"; ortak ise "Her iki hesap da: AKSİYON">
+👥 _Kaynak:_ <her kaynak için "badge Hesap Adı: AKSİYON"; tüm hesaplar aynı fikirdeyse "Tüm hesaplar: AKSİYON">
 📈 _Fiyat:_ ~<entry_then> → *<current> <currency>* (<pct_change>%); S&P'ye karşı <alpha_vs_sp500> puan
 📊 _Teknik:_ RSI <rsi> · 50G <ma50> · 200G <ma200> · 52H <low52>–<high52> · hacim <vol_trend>
 📰 _Haber:_ <news listesindeki en önemli 1 başlığı Türkçe, kısa özetle + (tarih). news boşsa bu satırı YAZMA.>
