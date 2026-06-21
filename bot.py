@@ -31,7 +31,7 @@ logging.basicConfig(
 log = logging.getLogger("assembly-bot")
 
 # Bump when shipping notable changes so /diag confirms which build is live.
-BUILD_TAG = "2026-06-12 add-rzayev"
+BUILD_TAG = "2026-06-12 4accounts"
 
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 
@@ -88,6 +88,8 @@ _ACCOUNT_DEFS = [
     ("assembly", "The Assembly", "InTheAssembly", "RSS_URL", ""),
     ("bora", "Bora Özkent", "BoraOzkent", "BORA_RSS_URL",
      "https://rss.app/feeds/XVMR34JsDkbWXBYl.xml"),
+    ("whale", "Whale Receipts", "WhaleReceipts", "WHALE_RSS_URL",
+     "https://rss.app/feeds/y1A7Zf5WQbQL24xm.xml"),
     ("rzayev", "Rzayev", "rzayev7895", "RZAYEV_RSS_URL", ""),
 ]
 
@@ -835,6 +837,57 @@ def _llm_error_message(e):
     return f"❌ Yapay zeka analiz hatası ({LLM_PROVIDER}/{LLM_MODEL}): {msg[:200]}"
 
 
+def macro_strategic_analysis(posts, period_text, accounts_label):
+    """Macro & strategic read across all tracked accounts' posts — beyond single
+    stock picks: market regime, institutional positioning / insider flows, sector
+    rotation, key risks/catalysts and a strategic takeaway. Grounded in the posts
+    only (no fabricated macro data)."""
+    text = "\n\n".join(
+        f"[{i+1}] Tarih: {p['date']}\nBaşlık: {p['title']}\nİçerik: {p['text']}"
+        for i, p in enumerate(posts)
+    )
+    system = (
+        "Sen kıdemli bir makro stratejist ve akış/positioning (kurumsal konumlanma) "
+        "analistisin. Türkçe, net ve abartısız yazarsın. ÇOK ÖNEMLİ: yalnızca verilen "
+        "paylaşımlarda AÇIKÇA geçen bilgiye dayan; makro veri, rakam, isim ya da olay "
+        "UYDURMA. Bir başlık için paylaşımlarda dayanak yoksa o başlığı atla."
+    )
+    user = f"""Takip edilen X hesaplarının ({accounts_label}) **{period_text}** paylaşımları
+aşağıda. Tek tek hisse önerilerinin ÖTESİNDE bir MAKRO & STRATEJİK görünüm çıkar.
+
+{text}
+
+Telegram'da okunacak, mobil dostu, KISA ve taranabilir yaz. Şu yapıda:
+
+━━━ 🌍 *MAKRO & STRATEJİK GÖRÜNÜM* ━━━
+🌡️ _Piyasa Rejimi:_ <risk-on / risk-off / nötr — tek cümle gerekçe>
+🏦 _Kurumsal Konumlanma & Akışlar:_ <insider/kurumsal alım-satım, büyük pozisyonlar; paylaşımlardaki somut akışlara dayan>
+🔄 _Sektör / Tema Rotasyonu:_ <öne çıkan sektör/temalar, paraya giriş-çıkış>
+⚠️ _Riskler & Katalizörler:_ <2-4 madde: yalnızca paylaşımlarda geçen makro veri/olaylar>
+🧭 _Stratejik Çıkarım:_ <1-2 cümle: bu görünümde genel nasıl konumlanılmalı (tek hisse değil)>
+
+Kurallar:
+- Yalnızca paylaşımlarda geçen olgulara dayan; dışarıdan veri/rakam ekleme.
+- Dayanak yoksa ilgili satırı "—" ile geç.
+- Kesin tahmin yerine olasılık dilini kullan."""
+    return _llm_chat(
+        [{"role": "system", "content": system}, {"role": "user", "content": user}],
+        max_tokens=1200, temperature=0.4,
+    )
+
+
+def _safe_macro(posts, period_text, accounts_label):
+    """Run the macro pass defensively; never let it break the main report."""
+    if not posts:
+        return ""
+    try:
+        section = (macro_strategic_analysis(posts, period_text, accounts_label) or "").strip()
+        return f"\n\n{section}" if section else ""
+    except Exception as e:  # noqa: BLE001 - macro is additive; degrade gracefully
+        log.warning("Makro analiz turu atlandı: %s", str(e)[:160])
+        return ""
+
+
 def analyze_combined(days, period_text, notify=None):
     """Combined pipeline across all tracked accounts:
     fetch (parallel) -> extract per account (attributed) -> merge & classify
@@ -900,6 +953,12 @@ def analyze_combined(days, period_text, notify=None):
     report = build_combined_report(items, period_text, counts)
     step("🔍 Rapor doğrulanıyor (son kontrol)...")
     report = verify_report(report, items)
+
+    # 6) Macro & strategic overlay across every account's posts (additive; the
+    #    main report is never blocked if this pass fails).
+    step("🌍 Makro & stratejik görünüm çıkarılıyor...")
+    all_posts = [p for key in ACCOUNTS for p in fetched[key][0]]
+    report += _safe_macro(all_posts, period_text, _account_names())
     return {"report": report, "counts": counts, "items": items}
 
 
